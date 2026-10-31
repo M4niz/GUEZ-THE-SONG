@@ -12,7 +12,7 @@ const AVATARS = [
 ];
 
 interface LobbyScreensProps {
-  onHostGame: (avatar: string) => void;
+  onHostGame: (avatar: string, name: string) => void;
   onJoinLobby: (code: string, name: string, avatar: string) => void;
   isHost: boolean;
   roomCode: string | null;

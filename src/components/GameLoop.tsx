@@ -60,7 +60,8 @@ function GameLoop() {
     rounds: [] as { song: Song, options: string[], type: 'title'|'artist' }[],
     answersThisRound: new Map<string, { optionIndex: number, tMs: number }>(),
     scores: {} as Record<string, number>,
-    streaks: {} as Record<string, number>
+    streaks: {} as Record<string, number>,
+    myAnswer: null as number | null
   });
 
   // ---------------- LOBBY & NETWORK ----------------
@@ -99,11 +100,13 @@ function GameLoop() {
     // Create an unlocked audio element on user gesture
     if (!audioRef.current) {
       const audio = new Audio();
-      // Play and pause a silent snippet or just call load/play/pause to unlock it
+      // Short 0.1s silent base64 MP3 snippet to safely unlock the AudioContext without throwing NotSupportedError
+      audio.src = 'data:audio/mp3;base64,//NExAAAAANIAAAAAExBTUUzLjEwMKqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq';
       audio.play().then(() => {
         audio.pause();
+        console.log("[Audio] Initial unlock successful");
       }).catch(e => {
-        console.warn("Initial audio unlock failed", e);
+        console.warn("[Audio] Initial audio unlock failed", e);
       });
       audioRef.current = audio;
     }
@@ -151,7 +154,7 @@ function GameLoop() {
     };
 
     const handleAnswer = (payload: any) => {
-      if (isHost && gameState === 'PLAYING') {
+      if (isHost) { // Allow recording answers even if state is slightly out of sync
         hostStateRef.current.answersThisRound.set(payload.playerId, {
           optionIndex: payload.optionIndex,
           tMs: payload.tMs
@@ -167,13 +170,13 @@ function GameLoop() {
       setRoundScores(payload.scores);
       setRoundStreaks(payload.streaks);
 
+      const answeredIndex = hostStateRef.current.myAnswer;
+
       // Play sound locally based on if we got it right
-      if (playerId !== 'HOST') { // host doesn't play
-        if (selectedAnswerIdx === payload.correctIndex) {
-          playCorrectTone();
-        } else {
-          playWrongTone();
-        }
+      if (answeredIndex === payload.correctIndex) {
+        playCorrectTone();
+      } else if (answeredIndex !== null) {
+        playWrongTone();
       }
 
       setGameState('REVEAL');
@@ -195,7 +198,7 @@ function GameLoop() {
     return () => {
       adapter.cleanup();
     };
-  }, [adapter, isHost, gameState, selectedAnswerIdx, playerId]);
+  }, [adapter, isHost, playerId]); // removed gameState and selectedAnswerIdx from deps!
 
   // ---------------- HOST LOGIC ----------------
 
@@ -325,18 +328,27 @@ function GameLoop() {
     if (gameState === 'PLAYING' && currentRoundData) {
       setTimeLeft(15);
       setSelectedAnswerIdx(null);
+      hostStateRef.current.myAnswer = null;
       setCorrectIndex(null);
+
+      console.log(`[GameLoop] PLAYING state started. Time left: 15s`);
 
       // Find song URL from local DB (in a real app, URL might be broadcasted or fetched)
       const song = songsData.find(s => s.id === currentRoundData.songId);
 
       if (song) {
+        console.log(`[Audio] Found song for round: ${song.title} - ${song.audioUrl}`);
         if (!audioRef.current) {
+           console.warn(`[Audio] audioRef was null during PLAYING. Creating a new Audio element (might fail autoplay).`);
            audioRef.current = new Audio();
         }
         audioRef.current.src = song.audioUrl;
         audioRef.current.load();
-        audioRef.current.play().catch(e => console.error("Audio blocked:", e));
+        audioRef.current.play().then(() => {
+          console.log(`[Audio] Playing successfully.`);
+        }).catch(e => console.error("[Audio] Playback blocked:", e));
+      } else {
+        console.error(`[Audio] Could not find song with ID ${currentRoundData.songId} in database.`);
       }
 
       // Start timer
@@ -365,10 +377,11 @@ function GameLoop() {
   }, [gameState, currentRoundData, isHost]);
 
   const handleClientAnswer = (idx: number, tMs?: number) => {
-    if (gameState !== 'PLAYING' || isHost) return;
+    if (gameState !== 'PLAYING') return;
     if (selectedAnswerIdx !== null) return; // already answered
 
     setSelectedAnswerIdx(idx);
+    hostStateRef.current.myAnswer = idx;
 
     if (audioRef.current) {
       // fade out or pause immediately
@@ -412,18 +425,6 @@ function GameLoop() {
 
   const renderPlaying = () => {
     if (!currentRoundData) return null;
-    if (isHost) {
-      return (
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
-          <h2 className="text-h2">Round {currentRoundNo}</h2>
-          <div style={{ color: 'var(--text-muted)', fontSize: '24px', margin: '20px 0' }}>Time Left: {timeLeft}s</div>
-          <div style={{ width: '80%', height: '16px', backgroundColor: 'var(--border-color)', borderRadius: '8px' }}>
-          <div style={{ height: '100%', width: `${(timeLeft / 15) * 100}%`, backgroundColor: 'var(--blue)', transition: 'width 0.25s linear' }} />
-          </div>
-          <button className="btn" onClick={hostEvaluateRound} style={{ marginTop: '40px' }}>Force End Round</button>
-        </div>
-      )
-    }
 
     return (
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', padding: '20px', maxWidth: '600px', margin: '0 auto', width: '100%' }}>
@@ -491,19 +492,6 @@ const renderReveal = () => {
   const isCorrect = selectedAnswerIdx === correctIndex;
   const song = songsData.find(s => s.id === currentRoundData.songId);
 
-  if (isHost) {
-    return (
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '20px' }}>
-        <h2 className="text-h2">Time's Up!</h2>
-        <div style={{ margin: '20px 0', textAlign: 'center' }}>
-          <div style={{ fontWeight: 800, color: 'var(--text-muted)' }}>Correct Answer:</div>
-          <div style={{ fontSize: '24px', color: 'var(--green-dark)', fontWeight: 900 }}>{currentRoundData.options[correctIndex!]}</div>
-        </div>
-        <button className="btn" onClick={hostNextStep}>Show Leaderboard</button>
-      </div>
-    )
-  }
-
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', padding: '20px', maxWidth: '600px', margin: '0 auto', width: '100%', position: 'relative', overflow: 'hidden' }}>
       <div style={{ opacity: 0.5, pointerEvents: 'none', display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -542,9 +530,13 @@ const renderReveal = () => {
           </div>
           {song && <img src={song.artwork} alt="album art" style={{ width: '64px', height: '64px', borderRadius: '12px' }} />}
         </div>
-        <div style={{ color: 'var(--text-muted)', fontWeight: 800, textAlign: 'center', marginTop: '8px' }}>
-          Waiting for Host...
-        </div>
+        {isHost ? (
+          <button className="btn" onClick={hostNextStep} style={{ marginTop: '8px' }}>Continue</button>
+        ) : (
+          <div style={{ color: 'var(--text-muted)', fontWeight: 800, textAlign: 'center', marginTop: '8px' }}>
+            Waiting for Host...
+          </div>
+        )}
       </div>
     </div>
   );
