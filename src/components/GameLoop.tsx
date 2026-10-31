@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
 import { playCorrectTone, playWrongTone } from '../utils/audio';
-import songsData from '../data/songs.json';
 import { Music, Zap, Flame, Trophy } from 'lucide-react';
 import { LobbyScreens } from './LobbyScreens';
 import RealtimeAdapter from '../utils/realtime';
@@ -44,6 +43,7 @@ function GameLoop() {
   const totalRounds = 5;
 
   // Round Data (Client)
+  const [activePlaylist, setActivePlaylist] = useState<Song[]>([]);
   const [currentRoundData, setCurrentRoundData] = useState<Round | null>(null);
   const [timeLeft, setTimeLeft] = useState(15);
   const [selectedAnswerIdx, setSelectedAnswerIdx] = useState<number | null>(null);
@@ -80,6 +80,23 @@ function GameLoop() {
 
     const newAdapter = new RealtimeAdapter(code);
     setAdapter(newAdapter);
+
+    // Resume audio context on user gesture (Host click)
+    new (window.AudioContext || (window as any).webkitAudioContext)().resume();
+
+    // Create an unlocked audio element on user gesture
+    if (!audioRef.current) {
+      const audio = new Audio();
+      // Short 0.1s silent base64 MP3 snippet to safely unlock the AudioContext without throwing NotSupportedError
+      audio.src = 'data:audio/mp3;base64,//NExAAAAANIAAAAAExBTUUzLjEwMKqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq';
+      audio.play().then(() => {
+        audio.pause();
+        console.log("[Audio] Host initial unlock successful");
+      }).catch(e => {
+        console.warn("[Audio] Host initial audio unlock failed", e);
+      });
+      audioRef.current = audio;
+    }
 
     // Host joins their own room implicitly
     setPlayers([{ id: pid, name, avatar }]);
@@ -143,7 +160,10 @@ function GameLoop() {
       }
     };
 
-    const handleGameStart = () => {
+    const handleGameStart = (payload: any) => {
+      if (payload.playlist) {
+        setActivePlaylist(payload.playlist);
+      }
       setGameState('COUNTDOWN');
     };
 
@@ -202,15 +222,16 @@ function GameLoop() {
 
   // ---------------- HOST LOGIC ----------------
 
-  const hostStartGame = () => {
-    // Generate rounds
-    const shuffledSongs = [...songsData].sort(() => 0.5 - Math.random());
-    const selectedSongs = shuffledSongs.slice(0, totalRounds) as Song[];
+  const hostStartGame = (playlist: Song[]) => {
+    // Generate rounds from the dynamic playlist
+    setActivePlaylist(playlist);
+    const selectedSongs = playlist.slice(0, totalRounds);
 
     const rounds = selectedSongs.map(song => {
       const type = Math.random() > 0.5 ? 'title' : 'artist';
       const correctText = type === 'title' ? song.title : song.artist;
-      const distractors = songsData
+      // Get distractors from the rest of the playlist (or fallback to empty if too small)
+      const distractors = playlist
         .filter(s => s.id !== song.id)
         .map(s => type === 'title' ? s.title : s.artist)
         .filter((value, index, self) => self.indexOf(value) === index);
@@ -229,7 +250,7 @@ function GameLoop() {
       hostStateRef.current.streaks[p.id] = 0;
     });
 
-    adapter?.broadcast('game_start', {});
+    adapter?.broadcast('game_start', { playlist });
     hostStartRound(1);
   };
 
@@ -333,8 +354,8 @@ function GameLoop() {
 
       console.log(`[GameLoop] PLAYING state started. Time left: 15s`);
 
-      // Find song URL from local DB (in a real app, URL might be broadcasted or fetched)
-      const song = songsData.find(s => s.id === currentRoundData.songId);
+      // Find song URL from dynamic playlist
+      const song = activePlaylist.find(s => s.id === currentRoundData.songId);
 
       if (song) {
         console.log(`[Audio] Found song for round: ${song.title} - ${song.audioUrl}`);
@@ -490,7 +511,7 @@ function GameLoop() {
 const renderReveal = () => {
   if (!currentRoundData) return null;
   const isCorrect = selectedAnswerIdx === correctIndex;
-  const song = songsData.find(s => s.id === currentRoundData.songId);
+  const song = activePlaylist.find(s => s.id === currentRoundData.songId);
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', padding: '20px', maxWidth: '600px', margin: '0 auto', width: '100%', position: 'relative', overflow: 'hidden' }}>

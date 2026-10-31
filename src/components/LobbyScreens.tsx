@@ -1,6 +1,16 @@
-import { useState } from 'react';
-import { Users, LogIn, Plus, Cat, Dog, Bird, Rabbit, Turtle, Snail } from 'lucide-react';
+import { useState, useRef, useEffect } from 'react';
+import { Users, LogIn, Plus, Cat, Dog, Bird, Rabbit, Turtle, Snail, Search, Play, Square, X, Plus as PlusIcon } from 'lucide-react';
+import fetchJsonp from 'fetch-jsonp';
 import '../App.css';
+
+interface Song {
+  id: string;
+  title: string;
+  artist: string;
+  movie: string;
+  audioUrl: string;
+  artwork: string;
+}
 
 const AVATARS = [
   { id: 'cat', icon: Cat, color: 'var(--orange)' },
@@ -17,7 +27,7 @@ interface LobbyScreensProps {
   isHost: boolean;
   roomCode: string | null;
   players: { id: string; name: string; avatar?: string }[];
-  onStartHostGame: () => void;
+  onStartHostGame: (playlist: Song[]) => void;
 }
 
 export function LobbyScreens({
@@ -34,6 +44,73 @@ export function LobbyScreens({
   const [joinName, setJoinName] = useState('');
   const [selectedAvatar, setSelectedAvatar] = useState('cat');
   const [isHostForm, setIsHostForm] = useState(false);
+
+  // Host Playlist State
+  const [searchTerm, setSearchTerm] = useState('');
+  const [searchResults, setSearchResults] = useState<Song[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const [playlist, setPlaylist] = useState<Song[]>([]);
+  const [playingPreview, setPlayingPreview] = useState<string | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (audioRef.current) {
+        audioRef.current.pause();
+      }
+    };
+  }, []);
+
+  const handleSearch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!searchTerm.trim()) return;
+
+    setIsSearching(true);
+    try {
+      const response = await fetchJsonp(`https://itunes.apple.com/search?term=${encodeURIComponent(searchTerm)}&country=IN&entity=song&limit=10`);
+      const data = await response.json();
+
+      const mapped: Song[] = data.results
+        .filter((r: any) => r.previewUrl)
+        .map((r: any) => ({
+          id: r.trackId.toString(),
+          title: r.trackName,
+          artist: r.artistName,
+          movie: r.collectionName || '',
+          audioUrl: r.previewUrl,
+          artwork: r.artworkUrl100?.replace('100x100bb', '200x200bb') || ''
+        }));
+      setSearchResults(mapped);
+    } catch (err) {
+      console.error('Search failed', err);
+    }
+    setIsSearching(false);
+  };
+
+  const togglePreview = (url: string) => {
+    if (playingPreview === url && audioRef.current) {
+      audioRef.current.pause();
+      setPlayingPreview(null);
+    } else {
+      if (audioRef.current) audioRef.current.pause();
+      const audio = new Audio(url);
+      audio.play().catch(e => console.error(e));
+      audioRef.current = audio;
+      setPlayingPreview(url);
+
+      audio.onended = () => setPlayingPreview(null);
+    }
+  };
+
+  const addToPlaylist = (song: Song) => {
+    if (playlist.length >= 5) return;
+    if (playlist.some(s => s.id === song.id)) return;
+    setPlaylist([...playlist, song]);
+  };
+
+  const removeFromPlaylist = (id: string) => {
+    setPlaylist(playlist.filter(s => s.id !== id));
+  };
 
   const handleHostClick = () => {
     setIsHostForm(true);
@@ -214,14 +291,83 @@ export function LobbyScreens({
         </div>
 
         {isHost ? (
-          <button
-            className="btn"
-            onClick={onStartHostGame}
-            disabled={players.length < 1}
-            style={{ width: '100%', maxWidth: '320px' }}
-          >
-            START GAME
-          </button>
+          <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '24px' }}>
+            <div style={{ backgroundColor: 'white', border: '2px solid var(--border-color)', borderRadius: '24px', padding: '24px' }}>
+              <div style={{ fontWeight: 800, color: 'var(--text-muted)', marginBottom: '16px', display: 'flex', justifyContent: 'space-between' }}>
+                <span>PLAYLIST</span>
+                <span style={{ color: playlist.length === 5 ? 'var(--green-dark)' : 'var(--orange)' }}>
+                  {playlist.length} / 5 songs
+                </span>
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '24px', minHeight: '120px' }}>
+                {playlist.length === 0 && (
+                  <div style={{ textAlign: 'center', color: 'var(--border-color)', fontWeight: 800, padding: '20px' }}>
+                    Search and add 5 songs to start.
+                  </div>
+                )}
+                {playlist.map(song => (
+                  <div key={song.id} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '8px', border: '2px solid var(--border-color)', borderRadius: '12px' }}>
+                    <img src={song.artwork} style={{ width: '40px', height: '40px', borderRadius: '8px' }} alt="" />
+                    <div style={{ flex: 1, overflow: 'hidden' }}>
+                      <div style={{ fontWeight: 800, fontSize: '14px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{song.title}</div>
+                      <div style={{ color: 'var(--text-muted)', fontSize: '12px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{song.artist}</div>
+                    </div>
+                    <button onClick={() => removeFromPlaylist(song.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--red)' }}>
+                      <X size={20} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              {playlist.length < 5 && (
+                <>
+                  <form onSubmit={handleSearch} style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
+                    <input
+                      type="text"
+                      placeholder="Search iTunes (e.g. A.R. Rahman)"
+                      value={searchTerm}
+                      onChange={e => setSearchTerm(e.target.value)}
+                      style={{ flex: 1, padding: '12px', borderRadius: '12px', border: '2px solid var(--border-color)', outline: 'none', fontWeight: 700, fontSize: '16px' }}
+                    />
+                    <button type="submit" disabled={isSearching} style={{ backgroundColor: 'var(--blue)', color: 'white', border: 'none', borderRadius: '12px', padding: '0 16px', cursor: 'pointer' }}>
+                      <Search size={20} />
+                    </button>
+                  </form>
+
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '200px', overflowY: 'auto' }}>
+                    {searchResults.map(song => (
+                      <div key={song.id} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '8px', border: '1px solid var(--border-color)', borderRadius: '8px' }}>
+                        <button onClick={() => togglePreview(song.audioUrl)} style={{ background: 'var(--blue-light)', border: 'none', borderRadius: '50%', width: '32px', height: '32px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--blue-dark)', cursor: 'pointer' }}>
+                          {playingPreview === song.audioUrl ? <Square size={14} fill="currentColor" /> : <Play size={14} fill="currentColor" />}
+                        </button>
+                        <div style={{ flex: 1, overflow: 'hidden' }}>
+                          <div style={{ fontWeight: 800, fontSize: '14px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{song.title}</div>
+                          <div style={{ color: 'var(--text-muted)', fontSize: '12px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{song.artist}</div>
+                        </div>
+                        <button
+                          onClick={() => addToPlaylist(song)}
+                          disabled={playlist.some(s => s.id === song.id)}
+                          style={{ background: 'var(--green-light)', border: 'none', borderRadius: '50%', width: '32px', height: '32px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--green-dark)', cursor: playlist.some(s => s.id === song.id) ? 'default' : 'pointer', opacity: playlist.some(s => s.id === song.id) ? 0.3 : 1 }}
+                        >
+                          <PlusIcon size={16} strokeWidth={3} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+
+            <button
+              className="btn"
+              onClick={() => onStartHostGame(playlist)}
+              disabled={players.length < 1 || playlist.length !== 5}
+              style={{ width: '100%' }}
+            >
+              START GAME
+            </button>
+          </div>
         ) : (
           <div style={{ color: 'var(--text-muted)', fontWeight: 800, textAlign: 'center' }}>
             Waiting for host to start...
