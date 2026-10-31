@@ -27,6 +27,7 @@ interface Round {
 interface Player {
   id: string;
   name: string;
+  avatar?: string;
 }
 
 function GameLoop() {
@@ -69,7 +70,7 @@ function GameLoop() {
     return Array.from({length: 4}, () => chars[Math.floor(Math.random() * chars.length)]).join('');
   };
 
-  const handleHostGame = () => {
+  const handleHostGame = (avatar: string, name: string) => {
     const code = generateRoomCode();
     setIsHost(true);
     setRoomCode(code);
@@ -80,10 +81,10 @@ function GameLoop() {
     setAdapter(newAdapter);
 
     // Host joins their own room implicitly
-    setPlayers([{ id: pid, name: 'You' }]);
+    setPlayers([{ id: pid, name, avatar }]);
   };
 
-  const handleJoinLobby = (code: string, name: string) => {
+  const handleJoinLobby = (code: string, name: string, avatar: string) => {
     setIsHost(false);
     setRoomCode(code);
     const pid = `P_${Math.random().toString(36).substr(2, 9)}`;
@@ -95,10 +96,22 @@ function GameLoop() {
     // Resume audio context on user gesture (Join click)
     new (window.AudioContext || (window as any).webkitAudioContext)().resume();
 
-    // Tell host we joined
-    setTimeout(() => {
-      newAdapter.broadcast('join', { playerId: pid, name });
-    }, 500); // slight delay to ensure channel is open
+    // Create an unlocked audio element on user gesture
+    if (!audioRef.current) {
+      const audio = new Audio();
+      // Play and pause a silent snippet or just call load/play/pause to unlock it
+      audio.play().then(() => {
+        audio.pause();
+      }).catch(e => {
+        console.warn("Initial audio unlock failed", e);
+      });
+      audioRef.current = audio;
+    }
+
+    // Tell host we joined after connected
+    newAdapter.on('system_connected', () => {
+      newAdapter.broadcast('join', { playerId: pid, name, avatar });
+    });
   };
 
   useEffect(() => {
@@ -108,16 +121,22 @@ function GameLoop() {
       if (isHost) {
         setPlayers(prev => {
           if (prev.find(p => p.id === payload.playerId)) return prev;
-          const newPlayers = [...prev, { id: payload.playerId, name: payload.name }];
+          const newPlayers = [...prev, { id: payload.playerId, name: payload.name, avatar: payload.avatar }];
 
           // Host needs to keep players scores tracked
           hostStateRef.current.scores[payload.playerId] = 0;
           hostStateRef.current.streaks[payload.playerId] = 0;
 
-          // In a real app we'd broadcast the updated roster back,
-          // but for this spike, players don't strictly need to see everyone else until leaderboard.
+          // Broadcast the updated roster back
+          adapter.broadcast('roster_update', { players: newPlayers });
           return newPlayers;
         });
+      }
+    };
+
+    const handleRosterUpdate = (payload: any) => {
+      if (!isHost) {
+        setPlayers(payload.players);
       }
     };
 
@@ -166,6 +185,7 @@ function GameLoop() {
     };
 
     adapter.on('join', handleJoin);
+    adapter.on('roster_update', handleRosterUpdate);
     adapter.on('game_start', handleGameStart);
     adapter.on('round_start', handleRoundStart);
     adapter.on('answer', handleAnswer);
@@ -310,10 +330,13 @@ function GameLoop() {
       // Find song URL from local DB (in a real app, URL might be broadcasted or fetched)
       const song = songsData.find(s => s.id === currentRoundData.songId);
 
-      if (song && playerId !== 'HOST') { // Host doesn't play audio
-        const audio = new Audio(song.audioUrl);
-        audio.play().catch(e => console.error("Audio blocked:", e));
-        audioRef.current = audio;
+      if (song) {
+        if (!audioRef.current) {
+           audioRef.current = new Audio();
+        }
+        audioRef.current.src = song.audioUrl;
+        audioRef.current.load();
+        audioRef.current.play().catch(e => console.error("Audio blocked:", e));
       }
 
       // Start timer

@@ -38,6 +38,9 @@ class RealtimeAdapter {
 
       this.sbChannel.subscribe((status) => {
         console.log(`[Realtime] Supabase status: ${status}`);
+        if (status === 'SUBSCRIBED') {
+          this.triggerLocal('system_connected', {});
+        }
       });
 
     } else {
@@ -48,6 +51,9 @@ class RealtimeAdapter {
           this.triggerLocal(event.data.event, event.data.payload);
         }
       };
+      setTimeout(() => {
+        this.triggerLocal('system_connected', {});
+      }, 0);
     }
   }
 
