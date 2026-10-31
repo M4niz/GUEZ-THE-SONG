@@ -1,0 +1,158 @@
+:root {
+  --green: #58CC02;
+  --green-dark: #58A700;
+  --green-light: #D7FFB8;
+  --blue: #1CB0F6;
+  --blue-dark: #1899D6;
+  --blue-light: #DDF4FF;
+  --red: #FF4B4B;
+  --red-dark: #EA2B2B;
+  --red-light: #FFDFE0;
+  --yellow: #FFC800;
+  --orange: #FF9600;
+  --purple: #CE82FF;
+  --text-dark: #3C3C3C;
+  --text-muted: #777777;
+  --border-color: #E5E5E5;
+  --bg: #FFFFFF;
+}
+
+body {
+  margin: 0;
+  font-family: 'Nunito', sans-serif;
+  color: var(--text-dark);
+  background-color: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+
+*, *::before, *::after {
+  box-sizing: inherit;
+}
+
+/* Chunky 3D Button */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--green);
+  color: white;
+  font-family: 'Nunito', sans-serif;
+  font-weight: 800;
+  font-size: 17px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  border: none;
+  border-radius: 16px;
+  padding: 12px 24px;
+  border-bottom: 4px solid var(--green-dark);
+  cursor: pointer;
+  transition: all 0.1s;
+  user-select: none;
+  touch-action: manipulation;
+}
+
+.btn:active {
+  border-bottom: 0px solid var(--green-dark);
+  transform: translateY(4px);
+  margin-bottom: 4px; /* to prevent layout shift of below items if needed */
+}
+
+.btn:disabled {
+  background-color: var(--border-color);
+  border-bottom: 4px solid #C5C5C5;
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.btn:disabled:active {
+  transform: none;
+  border-bottom: 4px solid #C5C5C5;
+}
+
+/* Answer Card */
+.answer-card {
+  background-color: white;
+  border: 2px solid var(--border-color);
+  border-bottom: 4px solid var(--border-color);
+  border-radius: 16px;
+  padding: 16px;
+  font-family: 'Nunito', sans-serif;
+  font-weight: 700;
+  font-size: 17px;
+  color: var(--text-dark);
+  cursor: pointer;
+  transition: all 0.1s;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  user-select: none;
+  touch-action: manipulation;
+}
+
+.answer-card:hover {
+  background-color: #f7f7f7;
+}
+
+.answer-card:active {
+  transform: translateY(2px);
+  border-bottom-width: 2px;
+  margin-bottom: 2px;
+}
+
+.answer-card.selected {
+  background-color: var(--blue-light);
+  border-color: var(--blue);
+  color: var(--blue-dark);
+}
+
+.answer-card.correct {
+  background-color: var(--green-light);
+  border-color: var(--green);
+  color: var(--green-dark);
+}
+
+.answer-card.wrong {
+  background-color: var(--red-light);
+  border-color: var(--red);
+  color: var(--red-dark);
+  animation: shake 0.4s ease-in-out;
+}
+
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-5px); }
+  50% { transform: translateX(5px); }
+  75% { transform: translateX(-5px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .answer-card.wrong {
+    animation: none;
+  }
+}
+
+/* Typography Helpers */
+.text-h1 {
+  font-weight: 900;
+  font-size: 32px;
+  margin: 0;
+}
+
+.text-h2 {
+  font-weight: 900;
+  font-size: 28px;
+  margin: 0;
+}
+
+.text-body {
+  font-weight: 700;
+  font-size: 17px;
+}
