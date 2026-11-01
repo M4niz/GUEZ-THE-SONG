@@ -24,7 +24,7 @@ Vite 8, React 19, TypeScript (`verbatimModuleSyntax`: use `import type`), `@supa
 ```
 main.tsx -> App.tsx -> components/GameLoop.tsx   state machine, host logic, network handlers, timers
                          |- TopBar.tsx           theme toggle (top right) + exit button/confirm modal (top left, in-room only)
-                         |- LobbyScreens.tsx     home / join / lobby; host setup tabs "Pick songs" and "Artist / Language"
+                         |- LobbyScreens.tsx     home / join / lobby; host setup tabs "Pick songs", "Artists" (as-you-type artist dropdown, multi-select) and "Settings"
                          `- GameScreens.tsx      Countdown, Playing, Reveal, Leaderboard, End (podium), HostLeft (presentational)
 components/Effects.tsx   Confetti, XpBadge (points gather + count-up), StreakBadge (flame)
 components/Avatar.tsx    data/avatars.ts
@@ -44,7 +44,9 @@ data/songs.json          sample songs; NOT imported anywhere (dead data)
 - Network callbacks and timers read refs (`adapterRef`, `playersRef`, `hostRef`, `clockRef`), never React state, to avoid stale closures. Keep it that way.
 - Answers are not leaked ahead of time: `round_start` carries options and the clip URL only; title/artist/artwork arrive in `round_end`.
 
-**Round building.** `buildRounds(playlist, pool)` picks `title` or `artist` per round with 3 distractors from `pool` (normalized, so no duplicate or look-alike options; falls back to the other type if it can't find 3). "Pick songs" mode uses the 5 chosen songs as the pool. "Artist / Language" mode calls `buildAutoPlaylist`: it searches iTunes (up to 50 per term, `country=IN`), drops karaoke/remix/cover-style tracks, dedupes titles, filters by artist and by iTunes *genre* for language (there is no language field), shuffles, takes `TOTAL_ROUNDS`, and keeps the whole pool for distractors.
+**Game settings** (`GameSettings` in `utils/songs.ts`, edited in the lobby Settings tab): rounds, seconds per round, answer choices, question type. The host passes them to `hostStartGame`; the per-round length travels in `round_start.seconds` and the host keeps `hostRef.roundMs`, so never use a fixed round length.
+
+**Round building.** `buildRounds(playlist, pool)` picks `title` or `artist` per round with `choices - 1` distractors from `pool` (normalized, so no duplicate or look-alike options; falls back to the other type if it can't find 3). "Pick songs" mode uses the 5 chosen songs as the pool. "Artists" mode calls `buildAutoPlaylist(artistNames, language, rounds)`: it searches iTunes once per selected artist (up to 50 each, `country=IN`; artist names come from `searchArtists`, entity=musicArtist), drops karaoke/remix/cover-style tracks, dedupes titles, filters by artist and by iTunes *genre* for language (there is no language field), shuffles, takes `rounds` songs, and keeps the whole pool for distractors.
 
 **Scoring** (`evaluateRound`): 400 base + up to 600 time bonus + streak bonus (50 per consecutive correct including this one, max 250).
 
@@ -61,7 +63,7 @@ data/songs.json          sample songs; NOT imported anywhere (dead data)
 
 ## Plan vs. reality (not implemented)
 
-Presence-based disconnect detection (leaving relies on an explicit `leave` / `pagehide`, so a crashed tab stays in the roster), reconnect with stored player id, movie round type, language/difficulty-aware distractors in manual mode, settings (rounds, clip length), mascot, mute/vibration toggles, 12-player cap UI feedback beyond a rejection notice, `local` audio source / `songs.json` pipeline. Check this list before assuming a plan feature exists.
+Presence-based disconnect detection (leaving relies on an explicit `leave` / `pagehide`, so a crashed tab stays in the roster), reconnect with stored player id, movie round type, language/difficulty-aware distractors in manual mode, clip length setting (the round timer is the only length control; previews are 30 s), mascot, mute/vibration toggles, 12-player cap UI feedback beyond a rejection notice, `local` audio source / `songs.json` pipeline. Check this list before assuming a plan feature exists.
 
 ## Security note
 

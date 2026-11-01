@@ -9,9 +9,9 @@ import { rankPlayers } from '../utils/ranking';
 import RealtimeAdapter from '../utils/realtime';
 import { unlockAudio } from '../utils/audio';
 import {
-  ANSWER_GRACE_MS, COUNTDOWN_MS, MAX_PLAYERS, ROUND_MS, ROUND_SECONDS, TOTAL_ROUNDS, buildRounds
+  ANSWER_GRACE_MS, COUNTDOWN_MS, MAX_PLAYERS, ROUND_SECONDS, TOTAL_ROUNDS, buildRounds
 } from '../utils/songs';
-import type { HostRound, Song } from '../utils/songs';
+import type { GameSettings, HostRound, Song } from '../utils/songs';
 
 type GameState = 'LOBBY' | 'COUNTDOWN' | 'PLAYING' | 'REVEAL' | 'LEADERBOARD' | 'END';
 
@@ -20,6 +20,7 @@ const HOST_ID = 'HOST';
 interface ActiveRound extends RoundInfo {
   /** Host wall-clock time (ms) at which the clip starts and the timer begins */
   startAt: number;
+  seconds: number;
 }
 
 interface HostState {
@@ -28,6 +29,7 @@ interface HostState {
   started: boolean;
   roundOpen: boolean;
   startAt: number;
+  roundMs: number;
   answers: Map<string, { optionIndex: number; tMs: number }>;
   scores: Record<string, number>;
   streaks: Record<string, number>;
@@ -35,7 +37,7 @@ interface HostState {
 }
 
 const freshHostState = (): HostState => ({
-  rounds: [], roundNo: 0, started: false, roundOpen: false, startAt: 0,
+  rounds: [], roundNo: 0, started: false, roundOpen: false, startAt: 0, roundMs: ROUND_SECONDS * 1000,
   answers: new Map(), scores: {}, streaks: {}, evalTimeout: null
 });
 
@@ -222,7 +224,7 @@ function GameLoop() {
         const answer = h.answers.get(p.id);
         if (answer && answer.optionIndex === round.correctIndex) {
           const streak = (h.streaks[p.id] || 0) + 1;
-          const timeBonus = Math.max(0, ((ROUND_MS - answer.tMs) / ROUND_MS) * 600);
+          const timeBonus = Math.max(0, ((h.roundMs - answer.tMs) / h.roundMs) * 600);
           const streakBonus = Math.min(streak * 50, 250);
           const points = Math.floor(400 + timeBonus + streakBonus);
           h.scores[p.id] = (h.scores[p.id] || 0) + points;
@@ -297,8 +299,8 @@ function GameLoop() {
 
       // Time is measured by the host on arrival, so a client can't claim a faster answer
       const now = Date.now();
-      if (now < h.startAt - 500 || now > h.startAt + ROUND_MS + ANSWER_GRACE_MS) return;
-      h.answers.set(p.playerId, { optionIndex: idx, tMs: Math.min(ROUND_MS, Math.max(0, now - h.startAt)) });
+      if (now < h.startAt - 500 || now > h.startAt + h.roundMs + ANSWER_GRACE_MS) return;
+      h.answers.set(p.playerId, { optionIndex: idx, tMs: Math.min(h.roundMs, Math.max(0, now - h.startAt)) });
       checkAllAnswered();
     };
 
@@ -400,8 +402,8 @@ function GameLoop() {
   // ---------------- HOST FLOW ----------------
 
   /** Applies a round_start locally (clients receive it over the wire; the host calls it directly) */
-  const beginRound = (p: { roundNo: number; total: number; options: string[]; type: 'title' | 'artist'; startAt: number; audioUrl: string }) => {
-    setCurrentRound({ roundNo: p.roundNo, options: p.options, type: p.type, startAt: p.startAt });
+  const beginRound = (p: { roundNo: number; total: number; seconds: number; options: string[]; type: 'title' | 'artist'; startAt: number; audioUrl: string }) => {
+    setCurrentRound({ roundNo: p.roundNo, options: p.options, type: p.type, startAt: p.startAt, seconds: p.seconds });
     setTotalRounds(p.total);
     setCurrentSong({ audioUrl: p.audioUrl });
     setSelectedAnswerIdx(null);
@@ -410,7 +412,7 @@ function GameLoop() {
     setEarned({});
     setCorrectIds([]);
     setTimeFrac(1);
-    setTimeLeft(ROUND_SECONDS);
+    setTimeLeft(p.seconds);
     setCountdown(3);
     setGameState('COUNTDOWN');
   };
@@ -426,6 +428,7 @@ function GameLoop() {
     const payload = {
       roundNo,
       total: h.rounds.length,
+      seconds: h.roundMs / 1000,
       options: round.options,
       type: round.type,
       startAt: h.startAt,
@@ -437,15 +440,16 @@ function GameLoop() {
 
     // Timer lives on the host clock; the grace window lets in-flight answers land
     if (h.evalTimeout) clearTimeout(h.evalTimeout);
-    h.evalTimeout = window.setTimeout(() => evaluateRef.current(), COUNTDOWN_MS + ROUND_MS + ANSWER_GRACE_MS);
+    h.evalTimeout = window.setTimeout(() => evaluateRef.current(), COUNTDOWN_MS + h.roundMs + ANSWER_GRACE_MS);
   };
 
-  const hostStartGame = (playlist: Song[], pool: Song[]) => {
+  const hostStartGame = (playlist: Song[], pool: Song[], settings: GameSettings) => {
     const others = playersRef.current.filter(p => p.id !== HOST_ID);
     if (others.length < 1 || playlist.length === 0) return;
 
     const h = hostRef.current;
-    h.rounds = buildRounds(playlist.slice(0, TOTAL_ROUNDS), pool);
+    h.rounds = buildRounds(playlist.slice(0, settings.rounds), pool, settings);
+    h.roundMs = settings.roundSeconds * 1000;
     h.started = true;
     h.scores = {};
     h.streaks = {};
@@ -505,10 +509,11 @@ function GameLoop() {
 
     audioRef.current?.play().catch(e => console.error('[Audio] Playback blocked:', e));
 
-    const deadline = currentRound.startAt - clockRef.current.offset + ROUND_MS;
+    const roundMs = currentRound.seconds * 1000;
+    const deadline = currentRound.startAt - clockRef.current.offset + roundMs;
     const id = window.setInterval(() => {
       const left = Math.max(0, deadline - Date.now());
-      setTimeFrac(left / ROUND_MS);
+      setTimeFrac(left / roundMs);
       setTimeLeft(Math.ceil(left / 1000));
       if (left === 0) clearInterval(id);
     }, 100);

@@ -62,7 +62,7 @@ interface PlayingProps {
 }
 
 export function PlayingScreen({ round, total, timeLeft, timeFrac, selected, isHost, score, streak, answered, onAnswer }: PlayingProps) {
-  const timerColor = timeLeft <= 5 ? 'var(--red)' : timeLeft <= 8 ? 'var(--yellow)' : 'var(--green)';
+  const timerColor = timeFrac <= 0.33 ? 'var(--red)' : timeFrac <= 0.55 ? 'var(--yellow)' : 'var(--green)';
   const locked = selected !== null || isHost;
 
   return (
