@@ -1,667 +1,611 @@
 import { useState, useEffect, useRef } from 'react';
-import { playCorrectTone, playWrongTone } from '../utils/audio';
-import { Music, Zap, Flame, Trophy } from 'lucide-react';
 import { LobbyScreens } from './LobbyScreens';
+import { TopBar } from './TopBar';
+import {
+  CountdownScreen, PlayingScreen, RevealScreen, LeaderboardScreen, EndScreen, HostLeftScreen
+} from './GameScreens';
+import type { Player, RevealSong, RoundInfo } from './GameScreens';
+import { rankPlayers } from '../utils/ranking';
 import RealtimeAdapter from '../utils/realtime';
-import '../App.css';
+import { unlockAudio } from '../utils/audio';
+import {
+  ANSWER_GRACE_MS, COUNTDOWN_MS, MAX_PLAYERS, ROUND_MS, ROUND_SECONDS, TOTAL_ROUNDS, buildRounds
+} from '../utils/songs';
+import type { HostRound, Song } from '../utils/songs';
 
 type GameState = 'LOBBY' | 'COUNTDOWN' | 'PLAYING' | 'REVEAL' | 'LEADERBOARD' | 'END';
 
-interface Song {
-  id: string;
-  title: string;
-  artist: string;
-  movie: string;
-  audioUrl: string;
-  artwork: string;
-}
+const HOST_ID = 'HOST';
 
-interface Round {
-  songId: string;
-  options: string[];
-  type: 'title' | 'artist';
+interface ActiveRound extends RoundInfo {
+  /** Host wall-clock time (ms) at which the clip starts and the timer begins */
   startAt: number;
 }
 
-interface Player {
-  id: string;
-  name: string;
-  avatar?: string;
+interface HostState {
+  rounds: HostRound[];
+  roundNo: number;
+  started: boolean;
+  roundOpen: boolean;
+  startAt: number;
+  answers: Map<string, { optionIndex: number; tMs: number }>;
+  scores: Record<string, number>;
+  streaks: Record<string, number>;
+  evalTimeout: number | null;
 }
 
+const freshHostState = (): HostState => ({
+  rounds: [], roundNo: 0, started: false, roundOpen: false, startAt: 0,
+  answers: new Map(), scores: {}, streaks: {}, evalTimeout: null
+});
+
+const generateRoomCode = () => {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  return Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+};
+
 function GameLoop() {
-  // Network & Roles
+  // Network & roles
   const [isHost, setIsHost] = useState(false);
   const [roomCode, setRoomCode] = useState<string | null>(null);
   const [playerId, setPlayerId] = useState<string>('');
   const [adapter, setAdapter] = useState<RealtimeAdapter | null>(null);
+  const [sessionKey, setSessionKey] = useState(0);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [hostLeft, setHostLeft] = useState(false);
 
-  // Game State
+  // Game state
   const [gameState, setGameState] = useState<GameState>('LOBBY');
   const [players, setPlayers] = useState<Player[]>([]);
-  const [currentRoundNo, setCurrentRoundNo] = useState(0);
-  const totalRounds = 5;
-
-  // Round Data (Client)
-  const [activePlaylist, setActivePlaylist] = useState<Song[]>([]);
-  const [currentRoundData, setCurrentRoundData] = useState<Round | null>(null);
-  const [timeLeft, setTimeLeft] = useState(15);
+  const [totalRounds, setTotalRounds] = useState(TOTAL_ROUNDS);
+  const [currentRound, setCurrentRound] = useState<ActiveRound | null>(null);
+  const [currentSong, setCurrentSong] = useState<{ audioUrl: string } | null>(null);
+  const [countdown, setCountdown] = useState(3);
+  const [timeLeft, setTimeLeft] = useState(ROUND_SECONDS);
+  const [timeFrac, setTimeFrac] = useState(1);
   const [selectedAnswerIdx, setSelectedAnswerIdx] = useState<number | null>(null);
+  const [answerProgress, setAnswerProgress] = useState<{ count: number; total: number } | null>(null);
 
-  // Reveal Data
+  // Reveal data
   const [correctIndex, setCorrectIndex] = useState<number | null>(null);
-  const [roundScores, setRoundScores] = useState<Record<string, number>>({});
-  const [roundStreaks, setRoundStreaks] = useState<Record<string, number>>({});
+  const [scores, setScores] = useState<Record<string, number>>({});
+  const [streaks, setStreaks] = useState<Record<string, number>>({});
+  const [earned, setEarned] = useState<Record<string, number>>({});
+  const [revealSong, setRevealSong] = useState<RevealSong | null>(null);
+  const [correctIds, setCorrectIds] = useState<string[]>([]);
 
-  // Refs for loop management
+  // Refs: everything timers and network callbacks need lives here so they never read stale state
+  const adapterRef = useRef<RealtimeAdapter | null>(null);
+  const roleRef = useRef({ isHost: false, playerId: '' });
+  const playersRef = useRef<Player[]>([]);
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const timerRef = useRef<number | null>(null);
-  const hostStateRef = useRef({
-    rounds: [] as { song: Song, options: string[], type: 'title'|'artist' }[],
-    answersThisRound: new Map<string, { optionIndex: number, tMs: number }>(),
-    scores: {} as Record<string, number>,
-    streaks: {} as Record<string, number>,
-    myAnswer: null as number | null
-  });
+  const hostRef = useRef<HostState>(freshHostState());
+  const clockRef = useRef({ offset: 0, bestRtt: Infinity }); // hostTime - localTime
+  const joinTimerRef = useRef<number | null>(null);
+  const pingTimersRef = useRef<number[]>([]);
+  const evaluateRef = useRef<() => void>(() => {}); // host round-evaluation, set by the handlers effect
 
-  // ---------------- LOBBY & NETWORK ----------------
+  const clearSessionTimers = () => {
+    if (hostRef.current.evalTimeout) clearTimeout(hostRef.current.evalTimeout);
+    if (joinTimerRef.current) clearInterval(joinTimerRef.current);
+    pingTimersRef.current.forEach(clearTimeout);
+    pingTimersRef.current = [];
+    joinTimerRef.current = null;
+  };
 
-  const generateRoomCode = () => {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-    return Array.from({length: 4}, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+  // ---------------- SESSION ----------------
+
+  const exitGame = (message: string | null = null, announce = true) => {
+    const ad = adapterRef.current;
+    if (ad && announce) {
+      if (roleRef.current.isHost) ad.broadcast('host_left', {});
+      else ad.broadcast('leave', { playerId: roleRef.current.playerId });
+    }
+    clearSessionTimers();
+    audioRef.current?.pause();
+    hostRef.current = freshHostState();
+    playersRef.current = [];
+    clockRef.current = { offset: 0, bestRtt: Infinity };
+    adapterRef.current = null;
+    roleRef.current = { isHost: false, playerId: '' };
+
+    setAdapter(null);
+    setIsHost(false);
+    setRoomCode(null);
+    setPlayerId('');
+    setGameState('LOBBY');
+    setPlayers([]);
+    setTotalRounds(TOTAL_ROUNDS);
+    setCurrentRound(null);
+    setCurrentSong(null);
+    setSelectedAnswerIdx(null);
+    setAnswerProgress(null);
+    setCorrectIndex(null);
+    setScores({});
+    setStreaks({});
+    setEarned({});
+    setRevealSong(null);
+    setCorrectIds([]);
+    setHostLeft(false);
+    setNotice(message);
+    setSessionKey(k => k + 1); // remounts the lobby so it starts at HOME
+  };
+
+  const startSession = (code: string, pid: string, host: boolean) => {
+    const newAdapter = new RealtimeAdapter(code);
+    adapterRef.current = newAdapter;
+    roleRef.current = { isHost: host, playerId: pid };
+    // Must run inside the click that created/joined the room
+    audioRef.current = unlockAudio();
+
+    setNotice(null);
+    setIsHost(host);
+    setRoomCode(code);
+    setPlayerId(pid);
+    setAdapter(newAdapter);
+    return newAdapter;
+  };
+
+  const commitPlayers = (list: Player[]) => {
+    playersRef.current = list;
+    setPlayers(list);
+    adapterRef.current?.broadcast('roster_update', { players: list });
   };
 
   const handleHostGame = (avatar: string, name: string) => {
-    const code = generateRoomCode();
-    setIsHost(true);
-    setRoomCode(code);
-    const pid = 'HOST';
-    setPlayerId(pid);
-
-    const newAdapter = new RealtimeAdapter(code);
-    setAdapter(newAdapter);
-
-    // Resume audio context on user gesture (Host click)
-    new (window.AudioContext || (window as any).webkitAudioContext)().resume();
-
-    // Create an unlocked audio element on user gesture
-    if (!audioRef.current) {
-      const audio = new Audio();
-      // Short 0.1s silent base64 MP3 snippet to safely unlock the AudioContext without throwing NotSupportedError
-      audio.src = 'data:audio/mp3;base64,//NExAAAAANIAAAAAExBTUUzLjEwMKqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq';
-      audio.play().then(() => {
-        audio.pause();
-        console.log("[Audio] Host initial unlock successful");
-      }).catch(e => {
-        console.warn("[Audio] Host initial audio unlock failed", e);
-      });
-      audioRef.current = audio;
-    }
-
-    // Host joins their own room implicitly
-    setPlayers([{ id: pid, name, avatar }]);
+    hostRef.current = freshHostState();
+    startSession(generateRoomCode(), HOST_ID, true);
+    const me = { id: HOST_ID, name, avatar };
+    playersRef.current = [me];
+    setPlayers([me]);
   };
 
   const handleJoinLobby = (code: string, name: string, avatar: string) => {
-    setIsHost(false);
-    setRoomCode(code);
-    const pid = `P_${Math.random().toString(36).substr(2, 9)}`;
-    setPlayerId(pid);
+    const pid = `P_${Math.random().toString(36).slice(2, 11)}`;
+    const newAdapter = startSession(code, pid, false);
+    clockRef.current = { offset: 0, bestRtt: Infinity };
 
-    const newAdapter = new RealtimeAdapter(code);
-    setAdapter(newAdapter);
+    const sendJoin = () => newAdapter.broadcast('join', { playerId: pid, name, avatar });
+    const sendPing = () => newAdapter.broadcast('time_ping', { playerId: pid, t0: Date.now() });
 
-    // Resume audio context on user gesture (Join click)
-    new (window.AudioContext || (window as any).webkitAudioContext)().resume();
-
-    // Create an unlocked audio element on user gesture
-    if (!audioRef.current) {
-      const audio = new Audio();
-      // Short 0.1s silent base64 MP3 snippet to safely unlock the AudioContext without throwing NotSupportedError
-      audio.src = 'data:audio/mp3;base64,//NExAAAAANIAAAAAExBTUUzLjEwMKqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq';
-      audio.play().then(() => {
-        audio.pause();
-        console.log("[Audio] Initial unlock successful");
-      }).catch(e => {
-        console.warn("[Audio] Initial audio unlock failed", e);
-      });
-      audioRef.current = audio;
-    }
-
-    // Tell host we joined after connected
     newAdapter.on('system_connected', () => {
-      newAdapter.broadcast('join', { playerId: pid, name, avatar });
+      sendJoin();
+      sendPing();
+      pingTimersRef.current = [1000, 2500].map(ms => window.setTimeout(sendPing, ms));
+
+      // Retry the join a few times; if the host never answers the room doesn't exist
+      let attempts = 0;
+      joinTimerRef.current = window.setInterval(() => {
+        attempts += 1;
+        if (attempts >= 4) {
+          exitGame('Room not found. Check the code and try again.', false);
+        } else {
+          sendJoin();
+        }
+      }, 2500);
     });
   };
+
+  // ---------------- NETWORK HANDLERS ----------------
 
   useEffect(() => {
     if (!adapter) return;
 
-    const handleJoin = (payload: any) => {
-      if (isHost) {
-        setPlayers(prev => {
-          if (prev.find(p => p.id === payload.playerId)) return prev;
-          const newPlayers = [...prev, { id: payload.playerId, name: payload.name, avatar: payload.avatar }];
+    const hs = () => hostRef.current;
+    const activePlayers = () => playersRef.current.filter(p => p.id !== HOST_ID);
 
-          // Host needs to keep players scores tracked
-          hostStateRef.current.scores[payload.playerId] = 0;
-          hostStateRef.current.streaks[payload.playerId] = 0;
-
-          // Broadcast the updated roster back
-          adapter.broadcast('roster_update', { players: newPlayers });
-          return newPlayers;
-        });
-      }
-    };
-
-    const handleRosterUpdate = (payload: any) => {
-      if (!isHost) {
-        setPlayers(payload.players);
-      }
-    };
-
-    const handleGameStart = (payload: any) => {
-      if (payload.playlist) {
-        setActivePlaylist(payload.playlist);
-      }
-      setGameState('COUNTDOWN');
-    };
-
-    const handleRoundStart = (payload: any) => {
-      setCurrentRoundData(payload);
-      setCurrentRoundNo(payload.roundNo);
-      setGameState('COUNTDOWN');
-    };
-
-    const handleAnswer = (payload: any) => {
-      if (isHost) { // Allow recording answers even if state is slightly out of sync
-        hostStateRef.current.answersThisRound.set(payload.playerId, {
-          optionIndex: payload.optionIndex,
-          tMs: payload.tMs
-        });
-      }
-    };
-
-    const handleRoundEnd = (payload: any) => {
-      if (timerRef.current) clearInterval(timerRef.current);
-      if (audioRef.current) audioRef.current.pause();
-
+    const applyRoundEnd = (payload: any) => {
+      audioRef.current?.pause();
       setCorrectIndex(payload.correctIndex);
-      setRoundScores(payload.scores);
-      setRoundStreaks(payload.streaks);
-
-      const answeredIndex = hostStateRef.current.myAnswer;
-
-      // Play sound locally based on if we got it right
-      if (answeredIndex === payload.correctIndex) {
-        playCorrectTone();
-      } else if (answeredIndex !== null) {
-        playWrongTone();
-      }
-
+      setScores(payload.scores);
+      setStreaks(payload.streaks);
+      setEarned(payload.earned ?? {});
+      setRevealSong(payload.song ?? null);
+      setCorrectIds(payload.correctPlayers ?? []);
       setGameState('REVEAL');
     };
 
-    const handleFinal = (payload: any) => {
-      setRoundScores(payload.scores);
+    // ----- host side -----
+
+    const evaluateRound = () => {
+      const h = hs();
+      if (!h.roundOpen) return;
+      h.roundOpen = false;
+      if (h.evalTimeout) clearTimeout(h.evalTimeout);
+      h.evalTimeout = null;
+
+      const round = h.rounds[h.roundNo - 1];
+      const earnedNow: Record<string, number> = {};
+      const correctPlayers: string[] = [];
+
+      activePlayers().forEach(p => {
+        const answer = h.answers.get(p.id);
+        if (answer && answer.optionIndex === round.correctIndex) {
+          const streak = (h.streaks[p.id] || 0) + 1;
+          const timeBonus = Math.max(0, ((ROUND_MS - answer.tMs) / ROUND_MS) * 600);
+          const streakBonus = Math.min(streak * 50, 250);
+          const points = Math.floor(400 + timeBonus + streakBonus);
+          h.scores[p.id] = (h.scores[p.id] || 0) + points;
+          h.streaks[p.id] = streak;
+          earnedNow[p.id] = points;
+          correctPlayers.push(p.id);
+        } else {
+          h.streaks[p.id] = 0;
+          earnedNow[p.id] = 0;
+        }
+      });
+
+      const payload = {
+        correctIndex: round.correctIndex,
+        scores: { ...h.scores },
+        streaks: { ...h.streaks },
+        earned: earnedNow,
+        correctPlayers,
+        song: { title: round.song.title, artist: round.song.artist, artwork: round.song.artwork }
+      };
+      adapter.broadcast('round_end', payload);
+      applyRoundEnd(payload); // the host never receives its own broadcast
+    };
+
+    const checkAllAnswered = () => {
+      const h = hs();
+      if (!h.roundOpen) return;
+      const total = activePlayers().length;
+      const count = activePlayers().filter(p => h.answers.has(p.id)).length;
+      const progress = { count, total };
+      setAnswerProgress(progress);
+      adapter.broadcast('answer_progress', progress);
+      // Everyone is in: end the round shortly instead of waiting out the timer
+      if (total > 0 && count >= total) window.setTimeout(evaluateRound, 800);
+    };
+
+    const handleJoin = (p: any) => {
+      if (!isHost || !p?.playerId || p.playerId === HOST_ID) return;
+      const list = playersRef.current;
+      if (list.some(x => x.id === p.playerId)) {
+        adapter.broadcast('roster_update', { players: list }); // lets a retrying joiner in
+        return;
+      }
+      if (hs().started) {
+        adapter.broadcast('join_rejected', { playerId: p.playerId, reason: 'That game has already started.' });
+        return;
+      }
+      if (list.length >= MAX_PLAYERS) {
+        adapter.broadcast('join_rejected', { playerId: p.playerId, reason: 'That room is full.' });
+        return;
+      }
+      hs().scores[p.playerId] = 0;
+      hs().streaks[p.playerId] = 0;
+      commitPlayers([...list, { id: p.playerId, name: String(p.name ?? 'Player').slice(0, 15), avatar: p.avatar }]);
+    };
+
+    const handleLeave = (p: any) => {
+      if (!isHost || !p?.playerId) return;
+      if (!playersRef.current.some(x => x.id === p.playerId)) return;
+      commitPlayers(playersRef.current.filter(x => x.id !== p.playerId));
+      checkAllAnswered();
+    };
+
+    const handleAnswer = (p: any) => {
+      if (!isHost) return;
+      const h = hs();
+      if (!h.roundOpen || h.answers.has(p?.playerId)) return;
+      if (!activePlayers().some(x => x.id === p.playerId)) return;
+      const round = h.rounds[h.roundNo - 1];
+      const idx = Number(p.optionIndex);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= round.options.length) return;
+
+      // Time is measured by the host on arrival, so a client can't claim a faster answer
+      const now = Date.now();
+      if (now < h.startAt - 500 || now > h.startAt + ROUND_MS + ANSWER_GRACE_MS) return;
+      h.answers.set(p.playerId, { optionIndex: idx, tMs: Math.min(ROUND_MS, Math.max(0, now - h.startAt)) });
+      checkAllAnswered();
+    };
+
+    const handleTimePing = (p: any) => {
+      if (isHost) adapter.broadcast('time_pong', { to: p.playerId, t0: p.t0, hostNow: Date.now() });
+    };
+
+    // ----- client side -----
+
+    const handleTimePong = (p: any) => {
+      if (isHost || p.to !== playerId) return;
+      const t1 = Date.now();
+      const rtt = t1 - p.t0;
+      if (rtt < clockRef.current.bestRtt) {
+        clockRef.current = { bestRtt: rtt, offset: p.hostNow + rtt / 2 - t1 };
+      }
+    };
+
+    const handleRosterUpdate = (p: any) => {
+      if (isHost) return;
+      playersRef.current = p.players;
+      setPlayers(p.players);
+      if (p.players.some((x: Player) => x.id === playerId) && joinTimerRef.current) {
+        clearInterval(joinTimerRef.current);
+        joinTimerRef.current = null;
+      }
+    };
+
+    const handleJoinRejected = (p: any) => {
+      if (!isHost && p.playerId === playerId) exitGame(p.reason ?? 'Could not join that room.', false);
+    };
+
+    const handleGameStart = (p: any) => {
+      if (isHost) return;
+      setScores({});
+      setStreaks({});
+      setTotalRounds(p?.total ?? TOTAL_ROUNDS);
+      setGameState('COUNTDOWN');
+    };
+
+    const handleRoundStart = (p: any) => {
+      if (isHost) return;
+      beginRound(p);
+    };
+
+    const handleRoundEnd = (p: any) => {
+      if (!isHost) applyRoundEnd(p);
+    };
+
+    const handleShowLeaderboard = () => {
+      if (!isHost) setGameState('LEADERBOARD');
+    };
+
+    const handleAnswerProgress = (p: any) => {
+      if (!isHost) setAnswerProgress(p);
+    };
+
+    const handleFinal = (p: any) => {
+      if (isHost) return;
+      setScores(p.scores);
+      setStreaks(p.streaks ?? {});
       setGameState('END');
     };
 
-    adapter.on('join', handleJoin);
-    adapter.on('roster_update', handleRosterUpdate);
-    adapter.on('game_start', handleGameStart);
-    adapter.on('round_start', handleRoundStart);
-    adapter.on('answer', handleAnswer);
-    adapter.on('round_end', handleRoundEnd);
-    adapter.on('final', handleFinal);
+    const handleHostLeft = () => {
+      if (!isHost) {
+        clearSessionTimers();
+        audioRef.current?.pause();
+        setHostLeft(true);
+      }
+    };
+
+    const handlers: Record<string, (p: any) => void> = {
+      join: handleJoin, leave: handleLeave, answer: handleAnswer, time_ping: handleTimePing,
+      time_pong: handleTimePong, roster_update: handleRosterUpdate, join_rejected: handleJoinRejected,
+      game_start: handleGameStart, round_start: handleRoundStart, round_end: handleRoundEnd,
+      show_leaderboard: handleShowLeaderboard, answer_progress: handleAnswerProgress,
+      final: handleFinal, host_left: handleHostLeft
+    };
+    Object.entries(handlers).forEach(([event, fn]) => adapter.on(event, fn));
+
+    // Best effort: tell the room when this tab closes
+    const onPageHide = () => {
+      if (isHost) adapter.broadcast('host_left', {});
+      else adapter.broadcast('leave', { playerId });
+    };
+    window.addEventListener('pagehide', onPageHide);
+
+    // Exposed so the host buttons/timers use the same closure as the network handlers
+    evaluateRef.current = evaluateRound;
 
     return () => {
+      window.removeEventListener('pagehide', onPageHide);
       adapter.cleanup();
     };
-  }, [adapter, isHost, playerId]); // removed gameState and selectedAnswerIdx from deps!
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adapter, isHost, playerId]);
 
-  // ---------------- HOST LOGIC ----------------
+  // ---------------- HOST FLOW ----------------
 
-  const hostStartGame = (playlist: Song[]) => {
-    // Generate rounds from the dynamic playlist
-    setActivePlaylist(playlist);
-    const selectedSongs = playlist.slice(0, totalRounds);
-
-    const rounds = selectedSongs.map(song => {
-      const type = Math.random() > 0.5 ? 'title' : 'artist';
-      const correctText = type === 'title' ? song.title : song.artist;
-      // Get distractors from the rest of the playlist (or fallback to empty if too small)
-      const distractors = playlist
-        .filter(s => s.id !== song.id)
-        .map(s => type === 'title' ? s.title : s.artist)
-        .filter((value, index, self) => self.indexOf(value) === index);
-
-      const shuffledDistractors = distractors.sort(() => 0.5 - Math.random()).slice(0, 3);
-      const options = [...shuffledDistractors, correctText].sort(() => 0.5 - Math.random());
-
-      return { song, options, type: type as 'title' | 'artist' };
-    });
-
-    hostStateRef.current.rounds = rounds;
-    hostStateRef.current.scores = {};
-    hostStateRef.current.streaks = {};
-    players.forEach(p => {
-      hostStateRef.current.scores[p.id] = 0;
-      hostStateRef.current.streaks[p.id] = 0;
-    });
-
-    adapter?.broadcast('game_start', { playlist });
-    hostStartRound(1);
-  };
-
-  const hostStartRound = (roundNo: number) => {
-    const roundData = hostStateRef.current.rounds[roundNo - 1];
-    hostStateRef.current.answersThisRound.clear();
-
-    const payload = {
-      roundNo,
-      songId: roundData.song.id,
-      options: roundData.options,
-      type: roundData.type,
-      startAt: Date.now() + 3000 // 3 sec countdown
-    };
-
-    adapter?.broadcast('round_start', payload);
-
-    // Host also acts as a client visually
-    setCurrentRoundData(payload as any);
-    setCurrentRoundNo(roundNo);
+  /** Applies a round_start locally (clients receive it over the wire; the host calls it directly) */
+  const beginRound = (p: { roundNo: number; total: number; options: string[]; type: 'title' | 'artist'; startAt: number; audioUrl: string }) => {
+    setCurrentRound({ roundNo: p.roundNo, options: p.options, type: p.type, startAt: p.startAt });
+    setTotalRounds(p.total);
+    setCurrentSong({ audioUrl: p.audioUrl });
+    setSelectedAnswerIdx(null);
+    setCorrectIndex(null);
+    setAnswerProgress(null);
+    setEarned({});
+    setCorrectIds([]);
+    setTimeFrac(1);
+    setTimeLeft(ROUND_SECONDS);
+    setCountdown(3);
     setGameState('COUNTDOWN');
   };
 
-  const hostEvaluateRound = () => {
-    const roundData = hostStateRef.current.rounds[currentRoundNo - 1];
-    const correctText = roundData.type === 'title' ? roundData.song.title : roundData.song.artist;
-    const correctIndex = roundData.options.indexOf(correctText);
-
-    // Calculate scores
-    players.forEach(p => {
-      if (p.id === 'HOST') return; // Host doesn't score
-
-      const answer = hostStateRef.current.answersThisRound.get(p.id);
-      if (answer && answer.optionIndex === correctIndex) {
-        // Correct
-        const timeBonus = Math.max(0, (15000 - answer.tMs) / 15000 * 600);
-        const streak = hostStateRef.current.streaks[p.id] || 0;
-        const streakBonus = Math.min(streak * 50, 250);
-        const earned = Math.floor(400 + timeBonus + streakBonus);
-
-        hostStateRef.current.scores[p.id] += earned;
-        hostStateRef.current.streaks[p.id] += 1;
-      } else {
-        // Wrong or no answer
-        hostStateRef.current.streaks[p.id] = 0;
-      }
-    });
+  const hostStartRound = (roundNo: number) => {
+    const h = hostRef.current;
+    const round = h.rounds[roundNo - 1];
+    h.roundNo = roundNo;
+    h.answers.clear();
+    h.roundOpen = true;
+    h.startAt = Date.now() + COUNTDOWN_MS;
 
     const payload = {
-      correctIndex,
-      scores: hostStateRef.current.scores,
-      streaks: hostStateRef.current.streaks
+      roundNo,
+      total: h.rounds.length,
+      options: round.options,
+      type: round.type,
+      startAt: h.startAt,
+      audioUrl: round.song.audioUrl
     };
+    adapterRef.current?.broadcast('round_start', payload);
+    beginRound(payload);
+    setAnswerProgress({ count: 0, total: playersRef.current.filter(p => p.id !== HOST_ID).length });
 
-    adapter?.broadcast('round_end', payload);
+    // Timer lives on the host clock; the grace window lets in-flight answers land
+    if (h.evalTimeout) clearTimeout(h.evalTimeout);
+    h.evalTimeout = window.setTimeout(() => evaluateRef.current(), COUNTDOWN_MS + ROUND_MS + ANSWER_GRACE_MS);
+  };
 
-    // Host local update
-    setCorrectIndex(correctIndex);
-    setRoundScores(hostStateRef.current.scores);
-    setRoundStreaks(hostStateRef.current.streaks);
-    setGameState('REVEAL');
+  const hostStartGame = (playlist: Song[], pool: Song[]) => {
+    const others = playersRef.current.filter(p => p.id !== HOST_ID);
+    if (others.length < 1 || playlist.length === 0) return;
+
+    const h = hostRef.current;
+    h.rounds = buildRounds(playlist.slice(0, TOTAL_ROUNDS), pool);
+    h.started = true;
+    h.scores = {};
+    h.streaks = {};
+    others.forEach(p => { h.scores[p.id] = 0; h.streaks[p.id] = 0; });
+
+    setScores({});
+    setStreaks({});
+    setTotalRounds(h.rounds.length);
+    adapterRef.current?.broadcast('game_start', { total: h.rounds.length });
+    hostStartRound(1);
   };
 
   const hostNextStep = () => {
+    const h = hostRef.current;
     if (gameState === 'REVEAL') {
+      adapterRef.current?.broadcast('show_leaderboard', {});
       setGameState('LEADERBOARD');
     } else if (gameState === 'LEADERBOARD') {
-      if (currentRoundNo < totalRounds) {
-        hostStartRound(currentRoundNo + 1);
+      if (h.roundNo < h.rounds.length) {
+        hostStartRound(h.roundNo + 1);
       } else {
-        adapter?.broadcast('final', { scores: hostStateRef.current.scores });
+        adapterRef.current?.broadcast('final', { scores: h.scores, streaks: h.streaks });
         setGameState('END');
       }
     }
   };
 
-  // ---------------- CLIENT LOGIC ----------------
+  // ---------------- ROUND TIMELINE (all devices) ----------------
 
-  // Countdown & Audio Start Sync
+  // COUNTDOWN: preload the clip, then flip to PLAYING at startAt (converted to the local clock)
   useEffect(() => {
-    if (gameState === 'COUNTDOWN' && currentRoundData) {
-      let count = 3;
-      const interval = setInterval(() => {
-        count -= 1;
-        if (count <= 0) {
-          clearInterval(interval);
-          setGameState('PLAYING');
-        }
-      }, 1000);
-      return () => clearInterval(interval);
+    if (gameState !== 'COUNTDOWN' || !currentRound) return;
+
+    const el = audioRef.current;
+    if (el && currentSong) {
+      el.src = currentSong.audioUrl;
+      el.preload = 'auto';
+      el.load();
     }
-  }, [gameState, currentRoundData]);
 
-  // Playing phase & Timer
-  useEffect(() => {
-    if (gameState === 'PLAYING' && currentRoundData) {
-      setTimeLeft(15);
-      setSelectedAnswerIdx(null);
-      hostStateRef.current.myAnswer = null;
-      setCorrectIndex(null);
-
-      console.log(`[GameLoop] PLAYING state started. Time left: 15s`);
-
-      // Find song URL from dynamic playlist
-      const song = activePlaylist.find(s => s.id === currentRoundData.songId);
-
-      if (song) {
-        console.log(`[Audio] Found song for round: ${song.title} - ${song.audioUrl}`);
-        if (!audioRef.current) {
-           console.warn(`[Audio] audioRef was null during PLAYING. Creating a new Audio element (might fail autoplay).`);
-           audioRef.current = new Audio();
-        }
-        audioRef.current.src = song.audioUrl;
-        audioRef.current.load();
-        audioRef.current.play().then(() => {
-          console.log(`[Audio] Playing successfully.`);
-        }).catch(e => console.error("[Audio] Playback blocked:", e));
+    const localStart = currentRound.startAt - clockRef.current.offset;
+    const id = window.setInterval(() => {
+      const remaining = localStart - Date.now();
+      if (remaining <= 0) {
+        clearInterval(id);
+        setGameState('PLAYING');
       } else {
-        console.error(`[Audio] Could not find song with ID ${currentRoundData.songId} in database.`);
+        setCountdown(Math.min(3, Math.ceil(remaining / 1000)));
       }
+    }, 100);
+    return () => clearInterval(id);
+  }, [gameState, currentRound, currentSong]);
 
-      // Start timer
-      const startTime = Date.now();
-      timerRef.current = window.setInterval(() => {
-        const elapsed = (Date.now() - startTime) / 1000;
-        const left = Math.max(0, 15 - Math.floor(elapsed));
-        setTimeLeft(left);
+  // PLAYING: start audio and drive the timer bar from the shared deadline
+  useEffect(() => {
+    if (gameState !== 'PLAYING' || !currentRound) return;
 
-        if (left === 0) {
-          if (timerRef.current) clearInterval(timerRef.current);
-          if (isHost) {
-            hostEvaluateRound();
-          } else if (selectedAnswerIdx === null) {
-            // Auto-submit empty if time runs out and no answer
-            handleClientAnswer(-1, 15000);
-          }
-        }
-      }, 250); // check 4x a sec for accuracy
+    audioRef.current?.play().catch(e => console.error('[Audio] Playback blocked:', e));
 
-      return () => {
-        if (timerRef.current) clearInterval(timerRef.current);
-        if (audioRef.current) audioRef.current.pause();
-      };
-    }
-  }, [gameState, currentRoundData, isHost]);
+    const deadline = currentRound.startAt - clockRef.current.offset + ROUND_MS;
+    const id = window.setInterval(() => {
+      const left = Math.max(0, deadline - Date.now());
+      setTimeFrac(left / ROUND_MS);
+      setTimeLeft(Math.ceil(left / 1000));
+      if (left === 0) clearInterval(id);
+    }, 100);
 
-  const handleClientAnswer = (idx: number, tMs?: number) => {
-    if (gameState !== 'PLAYING') return;
-    if (selectedAnswerIdx !== null) return; // already answered
+    return () => {
+      clearInterval(id);
+      audioRef.current?.pause();
+    };
+  }, [gameState, currentRound]);
 
+  const handleClientAnswer = (idx: number) => {
+    if (isHost || gameState !== 'PLAYING' || selectedAnswerIdx !== null) return;
     setSelectedAnswerIdx(idx);
-    hostStateRef.current.myAnswer = idx;
-
-    if (audioRef.current) {
-      // fade out or pause immediately
-      audioRef.current.pause();
-    }
-
-    const timeToAnswer = tMs !== undefined ? tMs : (15 - timeLeft) * 1000;
-
-    adapter?.broadcast('answer', {
-      playerId,
-      optionIndex: idx,
-      tMs: timeToAnswer
-    });
+    adapterRef.current?.broadcast('answer', { playerId, optionIndex: idx });
   };
 
-  // ---------------- RENDERERS ----------------
+  // ---------------- RENDER ----------------
 
-  if (!roomCode || gameState === 'LOBBY') {
-    return (
+  const goHome = () => exitGame(null, false);
+
+  let content: React.ReactNode;
+
+  if (hostLeft) {
+    content = <HostLeftScreen onHome={goHome} />;
+  } else if (!roomCode || gameState === 'LOBBY') {
+    content = (
       <LobbyScreens
+        key={sessionKey}
         isHost={isHost}
         roomCode={roomCode}
         players={players}
         onHostGame={handleHostGame}
         onJoinLobby={handleJoinLobby}
         onStartHostGame={hostStartGame}
+        notice={notice}
+        onDismissNotice={() => setNotice(null)}
       />
     );
+  } else if (gameState === 'COUNTDOWN') {
+    content = <CountdownScreen count={countdown} />;
+  } else if (gameState === 'PLAYING' && currentRound) {
+    content = (
+      <PlayingScreen
+        round={currentRound}
+        total={totalRounds}
+        timeLeft={timeLeft}
+        timeFrac={timeFrac}
+        selected={selectedAnswerIdx}
+        isHost={isHost}
+        score={scores[playerId] || 0}
+        streak={streaks[playerId] || 0}
+        answered={answerProgress}
+        onAnswer={handleClientAnswer}
+      />
+    );
+  } else if (gameState === 'REVEAL' && currentRound && correctIndex !== null) {
+    const nonHost = players.filter(p => p.id !== HOST_ID);
+    content = (
+      <RevealScreen
+        key={currentRound.roundNo}
+        roundNo={currentRound.roundNo}
+        total={totalRounds}
+        isHost={isHost}
+        selected={selectedAnswerIdx}
+        correctIndex={correctIndex}
+        options={currentRound.options}
+        song={revealSong}
+        score={scores[playerId] || 0}
+        earned={earned[playerId] || 0}
+        streak={streaks[playerId] || 0}
+        correctPlayers={players.filter(p => correctIds.includes(p.id))}
+        respondents={nonHost.length}
+        onContinue={hostNextStep}
+      />
+    );
+  } else if (gameState === 'LEADERBOARD') {
+    content = (
+      <LeaderboardScreen
+        rows={rankPlayers(players, scores, streaks)}
+        playerId={playerId}
+        isHost={isHost}
+        isLastRound={(currentRound?.roundNo ?? 0) >= totalRounds}
+        onNext={hostNextStep}
+      />
+    );
+  } else if (gameState === 'END') {
+    content = <EndScreen rows={rankPlayers(players, scores, streaks)} playerId={playerId} onHome={goHome} />;
+  } else {
+    content = <CountdownScreen count={0} />; // waiting for the first round_start
   }
 
-  const myScore = roundScores[playerId] || 0;
-  const myStreak = roundStreaks[playerId] || 0;
-
-  const renderCountdown = () => (
-    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-      <h1 className="text-h1" style={{ fontSize: '80px', animation: 'pop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275)' }}>
-        Ready
-      </h1>
-    </div>
-  );
-
-  const renderPlaying = () => {
-    if (!currentRoundData) return null;
-
-    return (
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', padding: '20px', maxWidth: '600px', margin: '0 auto', width: '100%' }}>
-        {/* Top Bar */}
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-          <div style={{ fontWeight: 800, color: 'var(--text-muted)' }}>Round {currentRoundNo}/{totalRounds}</div>
-          <div style={{ display: 'flex', gap: '16px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '4px', color: 'var(--orange)', fontWeight: 800 }}>
-              <Flame size={20} fill={myStreak >= 3 ? "currentColor" : "none"} /> {myStreak}
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '4px', color: 'var(--yellow)', fontWeight: 800 }}>
-              <Zap size={20} fill="currentColor" /> {myScore}
-            </div>
-          </div>
-        </div>
-
-        {/* Timer Bar */}
-        <div style={{ height: '16px', backgroundColor: 'var(--border-color)', borderRadius: '8px', overflow: 'hidden', marginBottom: '32px' }}>
-          <div style={{
-            height: '100%',
-          width: `${(timeLeft / 15) * 100}%`,
-            backgroundColor: timeLeft <= 5 ? 'var(--red)' : 'var(--green)',
-            transition: 'width 0.25s linear, background-color 0.3s'
-          }} />
-        </div>
-
-        {/* Question Area */}
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', marginBottom: '32px' }}>
-           <div style={{ width: '120px', height: '120px', borderRadius: '50%', backgroundColor: 'var(--blue-light)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--blue)', marginBottom: '24px', animation: 'pulse 1.5s infinite' }}>
-              <Music size={48} />
-           </div>
-           <h2 className="text-h2" style={{ textAlign: 'center' }}>
-             Guess the {currentRoundData.type === 'title' ? 'Song' : 'Artist'}!
-           </h2>
-        </div>
-
-        {/* Options */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-          {currentRoundData.options.map((opt, i) => (
-            <button
-              key={i}
-            className={`answer-card ${selectedAnswerIdx === i ? 'selected' : ''}`}
-              onClick={() => handleClientAnswer(i)}
-              disabled={selectedAnswerIdx !== null}
-              style={{ textAlign: 'left', opacity: (selectedAnswerIdx !== null && selectedAnswerIdx !== i) ? 0.6 : 1 }}
-            >
-              <div style={{
-                width: '32px', height: '32px', borderRadius: '8px',
-                border: '2px solid', borderColor: selectedAnswerIdx === i ? 'var(--blue)' : 'var(--border-color)',
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                fontWeight: 800, color: selectedAnswerIdx === i ? 'var(--blue-dark)' : 'var(--text-muted)'
-              }}>
-                {i + 1}
-              </div>
-              <div style={{ flex: 1 }}>{opt}</div>
-            </button>
-          ))}
-        </div>
-      </div>
-    );
-};
-
-const renderReveal = () => {
-  if (!currentRoundData) return null;
-  const isCorrect = selectedAnswerIdx === correctIndex;
-  const song = activePlaylist.find(s => s.id === currentRoundData.songId);
-
   return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', padding: '20px', maxWidth: '600px', margin: '0 auto', width: '100%', position: 'relative', overflow: 'hidden' }}>
-      <div style={{ opacity: 0.5, pointerEvents: 'none', display: 'flex', flexDirection: 'column', height: '100%' }}>
-         <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '20px' }}>
-            <div style={{ fontWeight: 800 }}>Round {currentRoundNo}</div>
-         </div>
-         <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginTop: 'auto' }}>
-          {currentRoundData.options.map((opt, i) => {
-            let stateClass = '';
-            if (i === correctIndex) stateClass = 'correct';
-            else if (i === selectedAnswerIdx && !isCorrect) stateClass = 'wrong';
-
-            return (
-              <div key={i} className={`answer-card ${stateClass}`}>
-                <div style={{ flex: 1 }}>{opt}</div>
-              </div>
-            )
-          })}
-        </div>
-      </div>
-
-      <div style={{
-        position: 'absolute', bottom: 0, left: 0, right: 0,
-        backgroundColor: isCorrect ? 'var(--green-light)' : 'var(--red-light)',
-        padding: '24px', borderTopLeftRadius: '24px', borderTopRightRadius: '24px',
-        display: 'flex', flexDirection: 'column', gap: '16px',
-        animation: 'slideUp 0.3s ease-out',
-        borderTop: `2px solid ${isCorrect ? 'var(--green)' : 'var(--red)'}`
-      }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div>
-            <h2 className="text-h2" style={{ color: isCorrect ? 'var(--green-dark)' : 'var(--red-dark)' }}>
-              {isCorrect ? 'Excellent!' : 'Incorrect'}
-            </h2>
-            {!isCorrect && <div style={{ color: 'var(--red-dark)', fontWeight: 800 }}>Correct: {currentRoundData.options[correctIndex!]}</div>}
-          </div>
-          {song && <img src={song.artwork} alt="album art" style={{ width: '64px', height: '64px', borderRadius: '12px' }} />}
-        </div>
-        {isHost ? (
-          <button className="btn" onClick={hostNextStep} style={{ marginTop: '8px' }}>Continue</button>
-        ) : (
-          <div style={{ color: 'var(--text-muted)', fontWeight: 800, textAlign: 'center', marginTop: '8px' }}>
-            Waiting for Host...
-          </div>
-        )}
-      </div>
-    </div>
+    <>
+      <TopBar inRoom={!!roomCode && !hostLeft} isHost={isHost} onExit={() => exitGame()} />
+      {content}
+    </>
   );
-};
-
-const renderLeaderboard = () => {
-  // Sort players by score
-  const sortedPlayers = players
-    .filter(p => p.id !== 'HOST')
-    .map(p => ({ ...p, score: roundScores[p.id] || 0 }))
-    .sort((a, b) => b.score - a.score);
-
-  return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '40px 20px', maxWidth: '600px', margin: '0 auto', width: '100%' }}>
-      <h2 className="text-h2" style={{ marginBottom: '32px' }}>Leaderboard</h2>
-
-      <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-        {sortedPlayers.map((p, i) => (
-          <div key={p.id} style={{
-            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-            padding: '16px 24px', backgroundColor: p.id === playerId ? 'var(--blue-light)' : 'white',
-            border: `2px solid ${p.id === playerId ? 'var(--blue)' : 'var(--border-color)'}`,
-            borderRadius: '16px', fontWeight: 800,
-            animation: `slideIn 0.3s ease-out ${i * 0.1}s both`
-          }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
-              <div style={{ width: '32px', color: 'var(--text-muted)' }}>#{i + 1}</div>
-              <div style={{ fontSize: '18px', color: p.id === playerId ? 'var(--blue-dark)' : 'var(--text-dark)' }}>
-                {p.name} {p.id === playerId ? '(You)' : ''}
-              </div>
-            </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '4px', color: 'var(--yellow)' }}>
-              <Zap size={20} fill="currentColor" /> {p.score}
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {isHost && (
-        <button className="btn" onClick={hostNextStep} style={{ marginTop: 'auto', width: '100%' }}>
-          {currentRoundNo < totalRounds ? 'NEXT ROUND' : 'FINISH GAME'}
-        </button>
-      )}
-      {!isHost && (
-        <div style={{ marginTop: 'auto', color: 'var(--text-muted)', fontWeight: 800 }}>
-          Waiting for Host...
-        </div>
-      )}
-    </div>
-  );
-};
-
-const renderEnd = () => {
-  const sortedPlayers = players
-    .filter(p => p.id !== 'HOST')
-    .map(p => ({ ...p, score: roundScores[p.id] || 0 }))
-    .sort((a, b) => b.score - a.score);
-
-  const winner = sortedPlayers[0];
-
-  return (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '24px', padding: '20px' }}>
-      <Trophy size={80} color="var(--yellow)" style={{ animation: 'bounce 2s infinite' }} />
-      <h1 className="text-h1" style={{ color: 'var(--yellow)' }}>Game Over!</h1>
-
-      {winner && (
-        <div style={{ backgroundColor: '#fff', border: '2px solid var(--yellow)', borderRadius: '16px', padding: '32px', width: '100%', maxWidth: '400px', textAlign: 'center', margin: '20px 0' }}>
-          <div style={{ color: 'var(--text-muted)', fontWeight: 800, marginBottom: '8px' }}>WINNER</div>
-          <div style={{ fontSize: '28px', fontWeight: 900, color: 'var(--text-dark)' }}>{winner.name}</div>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', color: 'var(--yellow)', fontSize: '32px', fontWeight: 900, marginTop: '8px' }}>
-            <Zap size={32} fill="currentColor" /> {winner.score}
-          </div>
-        </div>
-      )}
-
-      {isHost && (
-        <button className="btn" onClick={() => window.location.reload()} style={{ width: '100%', maxWidth: '400px' }}>
-          BACK TO HOME
-        </button>
-      )}
-    </div>
-  );
-};
-
-return (
-  <div style={{ minHeight: '100dvh', display: 'flex', flexDirection: 'column', backgroundColor: 'var(--bg)' }}>
-    {gameState === 'COUNTDOWN' && renderCountdown()}
-    {gameState === 'PLAYING' && renderPlaying()}
-    {gameState === 'REVEAL' && renderReveal()}
-    {gameState === 'LEADERBOARD' && renderLeaderboard()}
-    {gameState === 'END' && renderEnd()}
-
-    <style>{`
-      @keyframes slideIn {
-        from { transform: translateX(20px); opacity: 0; }
-        to { transform: translateX(0); opacity: 1; }
-      }
-      @keyframes bounce {
-        0%, 100% { transform: translateY(0); }
-        50% { transform: translateY(-10px); }
-      }
-    `}</style>
-  </div>
-);
 }
 
 export default GameLoop;

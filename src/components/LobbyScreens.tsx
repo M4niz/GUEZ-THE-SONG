@@ -1,25 +1,9 @@
 import { useState, useRef, useEffect } from 'react';
-import { Users, LogIn, Plus, Cat, Dog, Bird, Rabbit, Turtle, Snail, Search, Play, Square, X, Plus as PlusIcon } from 'lucide-react';
-import fetchJsonp from 'fetch-jsonp';
-import '../App.css';
-
-interface Song {
-  id: string;
-  title: string;
-  artist: string;
-  movie: string;
-  audioUrl: string;
-  artwork: string;
-}
-
-const AVATARS = [
-  { id: 'cat', icon: Cat, color: 'var(--orange)' },
-  { id: 'dog', icon: Dog, color: 'var(--blue)' },
-  { id: 'bird', icon: Bird, color: 'var(--green)' },
-  { id: 'rabbit', icon: Rabbit, color: 'var(--purple)' },
-  { id: 'turtle', icon: Turtle, color: 'var(--green-dark)' },
-  { id: 'snail', icon: Snail, color: 'var(--red)' }
-];
+import { Users, LogIn, Plus, Search, Play, Square, X, Check, Copy, Shuffle, Loader } from 'lucide-react';
+import { AVATARS } from '../data/avatars';
+import { Avatar } from './Avatar';
+import { LANGUAGES, TOTAL_ROUNDS, buildAutoPlaylist, searchItunes } from '../utils/songs';
+import type { Song } from '../utils/songs';
 
 interface LobbyScreensProps {
   onHostGame: (avatar: string, name: string) => void;
@@ -27,7 +11,24 @@ interface LobbyScreensProps {
   isHost: boolean;
   roomCode: string | null;
   players: { id: string; name: string; avatar?: string }[];
-  onStartHostGame: (playlist: Song[]) => void;
+  onStartHostGame: (playlist: Song[], pool: Song[]) => void;
+  notice: string | null;
+  onDismissNotice: () => void;
+}
+
+type SetupMode = 'pick' | 'auto';
+
+function SongRow({ song, children }: { song: Song; children: React.ReactNode }) {
+  return (
+    <div className="song-row">
+      {song.artwork ? <img className="art" src={song.artwork} alt="" /> : <div className="art">♪</div>}
+      <div className="meta">
+        <div className="song-title">{song.title}</div>
+        <div className="song-sub">{song.artist}</div>
+      </div>
+      <div className="actions">{children}</div>
+    </div>
+  );
 }
 
 export function LobbyScreens({
@@ -36,7 +37,9 @@ export function LobbyScreens({
   isHost,
   roomCode,
   players,
-  onStartHostGame
+  onStartHostGame,
+  notice,
+  onDismissNotice
 }: LobbyScreensProps) {
 
   const [view, setView] = useState<'HOME' | 'JOIN' | 'LOBBY'>('HOME');
@@ -44,14 +47,23 @@ export function LobbyScreens({
   const [joinName, setJoinName] = useState('');
   const [selectedAvatar, setSelectedAvatar] = useState('cat');
   const [isHostForm, setIsHostForm] = useState(false);
+  const [copied, setCopied] = useState(false);
 
-  // Host Playlist State
+  // Host setup
+  const [mode, setMode] = useState<SetupMode>('pick');
   const [searchTerm, setSearchTerm] = useState('');
   const [searchResults, setSearchResults] = useState<Song[]>([]);
   const [isSearching, setIsSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [searched, setSearched] = useState(false);
   const [playlist, setPlaylist] = useState<Song[]>([]);
   const [playingPreview, setPlayingPreview] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  const [autoArtist, setAutoArtist] = useState('');
+  const [autoLang, setAutoLang] = useState('any');
+  const [autoLoading, setAutoLoading] = useState(false);
+  const [autoError, setAutoError] = useState<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -61,55 +73,75 @@ export function LobbyScreens({
     };
   }, []);
 
+  const stopPreview = () => {
+    audioRef.current?.pause();
+    setPlayingPreview(null);
+  };
+
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!searchTerm.trim()) return;
 
     setIsSearching(true);
+    setSearchError(null);
     try {
-      const response = await fetchJsonp(`https://itunes.apple.com/search?term=${encodeURIComponent(searchTerm)}&country=IN&entity=song&limit=10`);
-      const data = await response.json();
-
-      const mapped: Song[] = data.results
-        .filter((r: any) => r.previewUrl)
-        .map((r: any) => ({
-          id: r.trackId.toString(),
-          title: r.trackName,
-          artist: r.artistName,
-          movie: r.collectionName || '',
-          audioUrl: r.previewUrl,
-          artwork: r.artworkUrl100?.replace('100x100bb', '200x200bb') || ''
-        }));
-      setSearchResults(mapped);
+      setSearchResults(await searchItunes(searchTerm.trim(), 15));
+      setSearched(true);
     } catch (err) {
       console.error('Search failed', err);
+      setSearchError('Search failed. Check your connection and try again.');
     }
     setIsSearching(false);
   };
 
   const togglePreview = (url: string) => {
     if (playingPreview === url && audioRef.current) {
-      audioRef.current.pause();
-      setPlayingPreview(null);
+      stopPreview();
     } else {
-      if (audioRef.current) audioRef.current.pause();
+      audioRef.current?.pause();
       const audio = new Audio(url);
       audio.play().catch(e => console.error(e));
+      audio.onended = () => setPlayingPreview(null);
       audioRef.current = audio;
       setPlayingPreview(url);
-
-      audio.onended = () => setPlayingPreview(null);
     }
   };
 
+  const inPlaylist = (id: string) => playlist.some(s => s.id === id);
+
   const addToPlaylist = (song: Song) => {
-    if (playlist.length >= 5) return;
-    if (playlist.some(s => s.id === song.id)) return;
+    if (playlist.length >= TOTAL_ROUNDS || inPlaylist(song.id)) return;
     setPlaylist([...playlist, song]);
   };
 
-  const removeFromPlaylist = (id: string) => {
-    setPlaylist(playlist.filter(s => s.id !== id));
+  const removeFromPlaylist = (id: string) => setPlaylist(playlist.filter(s => s.id !== id));
+
+  const handleStart = async () => {
+    stopPreview();
+    if (mode === 'pick') {
+      onStartHostGame(playlist, playlist);
+      return;
+    }
+    setAutoLoading(true);
+    setAutoError(null);
+    try {
+      const { playlist: picked, pool, note } = await buildAutoPlaylist(autoArtist, autoLang);
+      if (note) console.info('[Auto playlist]', note);
+      onStartHostGame(picked, pool);
+    } catch (err) {
+      setAutoError(err instanceof Error ? err.message : 'Something went wrong. Try again.');
+    }
+    setAutoLoading(false);
+  };
+
+  const copyCode = async () => {
+    try {
+      await navigator.clipboard.writeText(roomCode ?? '');
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard unavailable */
+    }
   };
 
   const handleHostClick = () => {
@@ -121,7 +153,6 @@ export function LobbyScreens({
     e.preventDefault();
     if (isHostForm) {
       if (joinName.trim()) {
-        // Fix: Call onHostGame and DO NOT call onJoinLobby, which overwrites host state
         onHostGame(selectedAvatar, joinName.trim());
         setView('LOBBY');
       }
@@ -135,28 +166,25 @@ export function LobbyScreens({
 
   if (view === 'HOME') {
     return (
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '32px', padding: '20px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: '96px', height: '96px', backgroundColor: 'var(--green)', borderRadius: '32px', color: 'white' }}>
+      <div className="page page-center">
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: '96px', height: '96px', backgroundColor: 'var(--green)', borderRadius: '32px', color: 'white', borderBottom: '6px solid var(--green-dark)' }}>
           <Users size={56} />
         </div>
-        <h1 className="text-h1" style={{ color: 'var(--green-dark)', textAlign: 'center' }}>Guess the Song</h1>
+        <h1 className="text-h1" style={{ color: 'var(--green-text)' }}>Guess the Song</h1>
+
+        {notice && (
+          <div className="card" role="status" style={{ borderColor: 'var(--orange)', width: '100%', maxWidth: '320px', display: 'flex', alignItems: 'center', gap: '12px', textAlign: 'left', padding: '14px 16px' }}>
+            <div style={{ flex: 1, fontWeight: 800 }}>{notice}</div>
+            <button className="icon-btn sm" aria-label="Dismiss" onClick={onDismissNotice}><X size={16} /></button>
+          </div>
+        )}
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', width: '100%', maxWidth: '320px' }}>
-          <button className="btn" onClick={handleHostClick} style={{ width: '100%', gap: '8px' }}>
-            <Plus size={20} /> CREATE ROOM
+          <button className="btn" onClick={handleHostClick}>
+            <Plus size={20} /> Create room
           </button>
-
-          <button
-            className="btn"
-            onClick={() => setView('JOIN')}
-            style={{
-              width: '100%',
-              backgroundColor: 'var(--blue)',
-              borderBottomColor: 'var(--blue-dark)',
-              gap: '8px'
-            }}
-          >
-            <LogIn size={20} /> JOIN ROOM
+          <button className="btn blue" onClick={() => { setIsHostForm(false); setView('JOIN'); }}>
+            <LogIn size={20} /> Join room
           </button>
         </div>
       </div>
@@ -165,37 +193,33 @@ export function LobbyScreens({
 
   if (view === 'JOIN') {
     return (
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '24px', padding: '20px' }}>
-        <h1 className="text-h1" style={{ color: 'var(--blue-dark)' }}>
+      <div className="page page-center">
+        <h1 className="text-h1" style={{ color: 'var(--blue-text)' }}>
           {isHostForm ? 'Create Room' : 'Join Room'}
         </h1>
 
         <form onSubmit={handleJoinSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '16px', width: '100%', maxWidth: '320px' }}>
           {!isHostForm && (
             <input
+              className="input center"
               type="text"
-              placeholder="Room Code (4 letters)"
+              placeholder="Room code"
+              autoCapitalize="characters"
               value={joinCode}
-              onChange={(e) => setJoinCode(e.target.value.toUpperCase().slice(0, 4))}
-              style={{
-                padding: '16px', borderRadius: '16px', border: '2px solid var(--border-color)',
-                fontSize: '20px', fontWeight: 800, textAlign: 'center', textTransform: 'uppercase', outline: 'none'
-              }}
+              onChange={(e) => setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 4))}
+              style={{ letterSpacing: '6px' }}
             />
           )}
           <input
+            className="input center"
             type="text"
-            placeholder="Your Name"
+            placeholder="Your name"
             value={joinName}
             onChange={(e) => setJoinName(e.target.value.slice(0, 15))}
-            style={{
-              padding: '16px', borderRadius: '16px', border: '2px solid var(--border-color)',
-              fontSize: '20px', fontWeight: 800, textAlign: 'center', outline: 'none'
-            }}
           />
 
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <div style={{ color: 'var(--text-muted)', fontWeight: 800, textAlign: 'center', fontSize: '14px' }}>Choose your avatar</div>
+          <div>
+            <div className="field-label" style={{ textAlign: 'center' }}>Choose your avatar</div>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px' }}>
               {AVATARS.map(avatar => {
                 const Icon = avatar.icon;
@@ -207,33 +231,29 @@ export function LobbyScreens({
                     onClick={() => setSelectedAvatar(avatar.id)}
                     style={{
                       display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      padding: '12px', borderRadius: '12px', cursor: 'pointer',
+                      padding: '12px', borderRadius: '14px', cursor: 'pointer',
                       border: `2px solid ${isSelected ? avatar.color : 'var(--border-color)'}`,
-                      backgroundColor: isSelected ? `${avatar.color}22` : 'white',
+                      backgroundColor: isSelected ? `color-mix(in srgb, ${avatar.color} 18%, transparent)` : 'var(--surface)',
                       transition: 'all 0.2s', outline: 'none'
                     }}
                   >
-                    <Icon size={32} color={isSelected ? avatar.color : 'var(--border-color)'} />
+                    <Icon size={32} color={isSelected ? avatar.color : 'var(--text-muted)'} />
                   </button>
-                )
+                );
               })}
             </div>
           </div>
 
           <button
             type="submit"
-            className="btn"
+            className={`btn ${isHostForm ? '' : 'blue'}`}
             disabled={(!isHostForm && joinCode.length !== 4) || !joinName.trim()}
-            style={{
-              backgroundColor: isHostForm ? 'var(--green)' : 'var(--blue)',
-              borderBottomColor: isHostForm ? 'var(--green-dark)' : 'var(--blue-dark)',
-              marginTop: '8px'
-            }}
+            style={{ marginTop: '8px' }}
           >
-            {isHostForm ? 'CREATE' : 'JOIN'}
+            {isHostForm ? 'Create' : 'Join'}
           </button>
 
-          <button type="button" onClick={() => setView('HOME')} style={{ background: 'none', border: 'none', color: 'var(--text-muted)', fontWeight: 800, cursor: 'pointer', marginTop: '16px', padding: '8px' }}>
+          <button type="button" className="btn gray" style={{ border: 'none', background: 'none', color: 'var(--text-muted)' }} onClick={() => setView('HOME')}>
             Cancel
           </button>
         </form>
@@ -241,149 +261,149 @@ export function LobbyScreens({
     );
   }
 
-  if (view === 'LOBBY') {
-    return (
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '32px', padding: '40px 20px', maxWidth: '600px', margin: '0 auto', width: '100%' }}>
-        <div style={{ textAlign: 'center' }}>
-          <h2 className="text-h2" style={{ color: 'var(--text-muted)', marginBottom: '8px' }}>ROOM CODE</h2>
-          <div style={{
-            fontSize: '56px', fontWeight: 900, letterSpacing: '8px', color: 'var(--green-dark)',
-            backgroundColor: 'var(--green-light)', padding: '8px 32px', borderRadius: '24px'
-          }}>
-            {roomCode}
-          </div>
+  // ---------------- LOBBY ----------------
+  const needMorePlayers = players.length < 2;
+  const startDisabled =
+    needMorePlayers || autoLoading ||
+    (mode === 'pick' ? playlist.length !== TOTAL_ROUNDS : !autoArtist.trim() && autoLang === 'any');
+
+  return (
+    <div className="page" style={{ gap: '16px' }}>
+      <div className="card" style={{ textAlign: 'center', padding: '16px 20px' }}>
+        <div className="field-label">Room code</div>
+        <button
+          onClick={copyCode}
+          aria-label="Copy room code"
+          style={{
+            display: 'inline-flex', alignItems: 'center', gap: '12px', cursor: 'pointer',
+            fontFamily: 'inherit', fontSize: '48px', fontWeight: 900, letterSpacing: '8px', paddingLeft: '24px', paddingRight: '16px',
+            color: 'var(--green-text)', backgroundColor: 'var(--green-light)',
+            border: '2px solid var(--green)', borderRadius: '20px'
+          }}
+        >
+          {roomCode}
+          {copied ? <Check size={22} /> : <Copy size={22} style={{ opacity: 0.6 }} />}
+        </button>
+      </div>
+
+      <div className="card">
+        <div className="card-title">
+          <span>Players</span>
+          <span>{players.length} joined</span>
         </div>
-
-        <div style={{ width: '100%', backgroundColor: 'white', border: '2px solid var(--border-color)', borderRadius: '24px', padding: '24px' }}>
-          <div style={{ fontWeight: 800, color: 'var(--text-muted)', marginBottom: '16px', display: 'flex', justifyContent: 'space-between' }}>
-            <span>PLAYERS</span>
-            <span>{players.length} joined</span>
-          </div>
-
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '24px', minHeight: '100px', justifyContent: 'center' }}>
-            {players.length === 0 && (
-              <div style={{ width: '100%', textAlign: 'center', color: 'var(--border-color)', fontWeight: 800, alignSelf: 'center' }}>
-                Waiting for players...
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(76px, 1fr))', gap: '16px 8px', justifyItems: 'center' }}>
+          {players.map(p => (
+            <div key={p.id} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px', width: '100%', animation: 'pop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275)' }}>
+              <Avatar id={p.avatar} size={56} />
+              <div style={{ fontWeight: 800, fontSize: '13px', maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'center' }}>
+                {p.name}{p.id === 'HOST' ? ' ★' : ''}
               </div>
-            )}
-            {players.map((p, i) => {
-              const avatarObj = AVATARS.find(a => a.id === p.avatar) || AVATARS[1];
-              const Icon = avatarObj.icon;
-              return (
-                <div key={i} style={{
-                  display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px',
-                  animation: 'pop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275)'
-                }}>
-                  <div style={{
-                    width: '64px', height: '64px', borderRadius: '32px',
-                    backgroundColor: `${avatarObj.color}22`, border: `2px solid ${avatarObj.color}`,
-                    display: 'flex', alignItems: 'center', justifyContent: 'center'
-                  }}>
-                    <Icon size={32} color={avatarObj.color} />
-                  </div>
-                  <div style={{ fontWeight: 800, color: 'var(--text-dark)', fontSize: '14px', textAlign: 'center', maxWidth: '80px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {p.name} {p.id === 'HOST' ? '(Host)' : ''}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
+            </div>
+          ))}
         </div>
+      </div>
 
-        {isHost ? (
-          <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '24px' }}>
-            <div style={{ backgroundColor: 'white', border: '2px solid var(--border-color)', borderRadius: '24px', padding: '24px' }}>
-              <div style={{ fontWeight: 800, color: 'var(--text-muted)', marginBottom: '16px', display: 'flex', justifyContent: 'space-between' }}>
-                <span>PLAYLIST</span>
-                <span style={{ color: playlist.length === 5 ? 'var(--green-dark)' : 'var(--orange)' }}>
-                  {playlist.length} / 5 songs
-                </span>
-              </div>
-
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '24px', minHeight: '120px' }}>
-                {playlist.length === 0 && (
-                  <div style={{ textAlign: 'center', color: 'var(--border-color)', fontWeight: 800, padding: '20px' }}>
-                    Search and add 5 songs to start.
-                  </div>
-                )}
-                {playlist.map(song => (
-                  <div key={song.id} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '8px', border: '2px solid var(--border-color)', borderRadius: '12px' }}>
-                    <img src={song.artwork} style={{ width: '40px', height: '40px', borderRadius: '8px' }} alt="" />
-                    <div style={{ flex: 1, overflow: 'hidden' }}>
-                      <div style={{ fontWeight: 800, fontSize: '14px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{song.title}</div>
-                      <div style={{ color: 'var(--text-muted)', fontSize: '12px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{song.artist}</div>
-                    </div>
-                    <button onClick={() => removeFromPlaylist(song.id)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--red)' }}>
-                      <X size={20} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-
-              {playlist.length < 5 && (
-                <>
-                  <form onSubmit={handleSearch} style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
-                    <input
-                      type="text"
-                      placeholder="Search iTunes (e.g. A.R. Rahman)"
-                      value={searchTerm}
-                      onChange={e => setSearchTerm(e.target.value)}
-                      style={{ flex: 1, padding: '12px', borderRadius: '12px', border: '2px solid var(--border-color)', outline: 'none', fontWeight: 700, fontSize: '16px' }}
-                    />
-                    <button type="submit" disabled={isSearching} style={{ backgroundColor: 'var(--blue)', color: 'white', border: 'none', borderRadius: '12px', padding: '0 16px', cursor: 'pointer' }}>
-                      <Search size={20} />
-                    </button>
-                  </form>
-
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '200px', overflowY: 'auto' }}>
-                    {searchResults.map(song => (
-                      <div key={song.id} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '8px', border: '1px solid var(--border-color)', borderRadius: '8px' }}>
-                        <button onClick={() => togglePreview(song.audioUrl)} style={{ background: 'var(--blue-light)', border: 'none', borderRadius: '50%', width: '32px', height: '32px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--blue-dark)', cursor: 'pointer' }}>
-                          {playingPreview === song.audioUrl ? <Square size={14} fill="currentColor" /> : <Play size={14} fill="currentColor" />}
-                        </button>
-                        <div style={{ flex: 1, overflow: 'hidden' }}>
-                          <div style={{ fontWeight: 800, fontSize: '14px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{song.title}</div>
-                          <div style={{ color: 'var(--text-muted)', fontSize: '12px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{song.artist}</div>
-                        </div>
-                        <button
-                          onClick={() => addToPlaylist(song)}
-                          disabled={playlist.some(s => s.id === song.id)}
-                          style={{ background: 'var(--green-light)', border: 'none', borderRadius: '50%', width: '32px', height: '32px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--green-dark)', cursor: playlist.some(s => s.id === song.id) ? 'default' : 'pointer', opacity: playlist.some(s => s.id === song.id) ? 0.3 : 1 }}
-                        >
-                          <PlusIcon size={16} strokeWidth={3} />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                </>
-              )}
+      {isHost ? (
+        <>
+          <div className="card">
+            <div className="seg" role="tablist">
+              <button role="tab" aria-selected={mode === 'pick'} className={mode === 'pick' ? 'active' : ''} onClick={() => setMode('pick')}>Pick songs</button>
+              <button role="tab" aria-selected={mode === 'auto'} className={mode === 'auto' ? 'active' : ''} onClick={() => { stopPreview(); setMode('auto'); }}>Artist / Language</button>
             </div>
 
-            <button
-              className="btn"
-              onClick={() => onStartHostGame(playlist)}
-              disabled={players.length < 1 || playlist.length !== 5}
-              style={{ width: '100%' }}
-            >
-              START GAME
+            {mode === 'pick' ? (
+              <>
+                <form onSubmit={handleSearch} style={{ display: 'flex', gap: '8px', marginBottom: '14px' }}>
+                  <input
+                    className="input"
+                    type="text"
+                    placeholder="Search iTunes (e.g. A.R. Rahman)"
+                    value={searchTerm}
+                    onChange={e => setSearchTerm(e.target.value)}
+                  />
+                  <button type="submit" className="btn blue" disabled={isSearching || !searchTerm.trim()} aria-label="Search" style={{ height: '52px', padding: '0 18px', flex: 'none' }}>
+                    {isSearching ? <Loader size={20} /> : <Search size={20} />}
+                  </button>
+                </form>
+                {searchError && <div className="error-note" style={{ marginTop: 0, marginBottom: '12px' }}>{searchError}</div>}
+
+                <div className="scroll-area song-list" style={{ marginBottom: '20px' }}>
+                  {searchResults.length === 0 && (
+                    <div className="empty-note">{searched ? 'No playable songs found. Try another search.' : 'Search for a song or artist to add songs'}</div>
+                  )}
+                  {searchResults.map(song => (
+                    <SongRow key={song.id} song={song}>
+                      <button className="icon-btn sm blue" aria-label="Preview" onClick={() => togglePreview(song.audioUrl)}>
+                        {playingPreview === song.audioUrl ? <Square size={14} fill="currentColor" /> : <Play size={14} fill="currentColor" />}
+                      </button>
+                      <button className="icon-btn sm green" aria-label="Add to playlist" disabled={inPlaylist(song.id) || playlist.length >= TOTAL_ROUNDS} onClick={() => addToPlaylist(song)}>
+                        {inPlaylist(song.id) ? <Check size={16} strokeWidth={3} /> : <Plus size={16} strokeWidth={3} />}
+                      </button>
+                    </SongRow>
+                  ))}
+                </div>
+
+                <div className="card-title" style={{ marginBottom: '10px' }}>
+                  <span>Playlist</span>
+                  <span style={{ color: playlist.length === TOTAL_ROUNDS ? 'var(--green-text)' : 'var(--orange)' }}>
+                    {playlist.length} / {TOTAL_ROUNDS}
+                  </span>
+                </div>
+                <div className="song-list">
+                  {playlist.length === 0 && <div className="empty-note">Add {TOTAL_ROUNDS} songs to start</div>}
+                  {playlist.map(song => (
+                    <SongRow key={song.id} song={song}>
+                      <button className="icon-btn sm red" aria-label="Remove" onClick={() => removeFromPlaylist(song.id)}>
+                        <X size={16} strokeWidth={3} />
+                      </button>
+                    </SongRow>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="field-label">Artist</div>
+                <input
+                  className="input"
+                  type="text"
+                  placeholder="e.g. Anirudh Ravichander"
+                  value={autoArtist}
+                  onChange={e => setAutoArtist(e.target.value)}
+                  style={{ marginBottom: '20px' }}
+                />
+                <div className="field-label">Language</div>
+                <div className="chips">
+                  {LANGUAGES.map(l => (
+                    <button key={l.id} type="button" className={`chip ${autoLang === l.id ? 'active' : ''}`} onClick={() => setAutoLang(l.id)}>
+                      {l.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="hint-note">
+                  <Shuffle size={13} style={{ verticalAlign: '-2px', marginRight: '6px' }} />
+                  Choose an artist, a language, or both. We pull matching songs from iTunes, shuffle them, and pick {TOTAL_ROUNDS} for the game.
+                  Language is matched by iTunes genre, so it can miss some songs.
+                </div>
+                {autoError && <div className="error-note">{autoError}</div>}
+              </>
+            )}
+          </div>
+
+          <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '10px', paddingTop: '8px' }}>
+            {needMorePlayers && (
+              <div className="hint-note" style={{ textAlign: 'center', margin: 0 }}>Waiting for at least one player to join…</div>
+            )}
+            <button className="btn" onClick={handleStart} disabled={startDisabled} style={{ width: '100%' }}>
+              {autoLoading ? 'Finding songs…' : mode === 'auto' ? 'Shuffle & start' : 'Start game'}
             </button>
           </div>
-        ) : (
-          <div style={{ color: 'var(--text-muted)', fontWeight: 800, textAlign: 'center' }}>
-            Waiting for host to start...
-            <br/><span style={{ fontSize: '14px', fontWeight: 400 }}>Make sure your audio is unmuted.</span>
-          </div>
-        )}
-
-        <style>{`
-          @keyframes pop {
-            0% { transform: scale(0.5); opacity: 0; }
-            100% { transform: scale(1); opacity: 1; }
-          }
-        `}</style>
-      </div>
-    );
-  }
-
-  return null;
+        </>
+      ) : (
+        <div style={{ color: 'var(--text-muted)', fontWeight: 800, textAlign: 'center', marginTop: 'auto', padding: '16px' }}>
+          Waiting for host to start…
+          <br /><span style={{ fontSize: '14px', fontWeight: 700 }}>Make sure your audio is unmuted.</span>
+        </div>
+      )}
+    </div>
+  );
 }
