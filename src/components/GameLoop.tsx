@@ -1,15 +1,18 @@
 import { useState, useEffect, useRef } from 'react';
 import { LobbyScreens } from './LobbyScreens';
+import { Toasts } from './Toasts';
+import type { Toast } from './Toasts';
 import { TopBar } from './TopBar';
 import {
   CountdownScreen, PlayingScreen, RevealScreen, LeaderboardScreen, EndScreen, HostLeftScreen
 } from './GameScreens';
-import type { Player, RevealSong, RoundInfo } from './GameScreens';
+import type { AnswerInfo, Player, RevealSong, RoundDetail, RoundInfo } from './GameScreens';
 import { rankPlayers } from '../utils/ranking';
 import RealtimeAdapter from '../utils/realtime';
 import { unlockAudio } from '../utils/audio';
 import {
-  ANSWER_GRACE_MS, COUNTDOWN_MS, MAX_PLAYERS, ROUND_SECONDS, TOTAL_ROUNDS, buildRounds
+  ANSWER_GRACE_MS, COUNTDOWN_MS, MAX_PLAYERS, REVEAL_PICKS_AT, ROUND_SECONDS, SCORE_BASE, SCORE_SPEED,
+  STREAK_CAP, STREAK_STEP, TOTAL_ROUNDS, buildRounds
 } from '../utils/songs';
 import type { GameSettings, HostRound, Song } from '../utils/songs';
 
@@ -34,11 +37,12 @@ interface HostState {
   scores: Record<string, number>;
   streaks: Record<string, number>;
   evalTimeout: number | null;
+  revealTimeout: number | null;
 }
 
 const freshHostState = (): HostState => ({
   rounds: [], roundNo: 0, started: false, roundOpen: false, startAt: 0, roundMs: ROUND_SECONDS * 1000,
-  answers: new Map(), scores: {}, streaks: {}, evalTimeout: null
+  answers: new Map(), scores: {}, streaks: {}, evalTimeout: null, revealTimeout: null
 });
 
 const generateRoomCode = () => {
@@ -66,13 +70,15 @@ function GameLoop() {
   const [timeLeft, setTimeLeft] = useState(ROUND_SECONDS);
   const [timeFrac, setTimeFrac] = useState(1);
   const [selectedAnswerIdx, setSelectedAnswerIdx] = useState<number | null>(null);
-  const [answerProgress, setAnswerProgress] = useState<{ count: number; total: number } | null>(null);
+  const [answerProgress, setAnswerProgress] = useState<AnswerInfo | null>(null);
 
   // Reveal data
   const [correctIndex, setCorrectIndex] = useState<number | null>(null);
   const [scores, setScores] = useState<Record<string, number>>({});
   const [streaks, setStreaks] = useState<Record<string, number>>({});
   const [earned, setEarned] = useState<Record<string, number>>({});
+  const [detail, setDetail] = useState<Record<string, RoundDetail>>({});
+  const [toasts, setToasts] = useState<Toast[]>([]);
   const [revealSong, setRevealSong] = useState<RevealSong | null>(null);
   const [correctIds, setCorrectIds] = useState<string[]>([]);
 
@@ -86,9 +92,12 @@ function GameLoop() {
   const joinTimerRef = useRef<number | null>(null);
   const pingTimersRef = useRef<number[]>([]);
   const evaluateRef = useRef<() => void>(() => {}); // host round-evaluation, set by the handlers effect
+  const answerRef = useRef<(id: string, optionIndex: number) => void>(() => {}); // host records an answer (also used for the host's own)
+  const progressRef = useRef<() => void>(() => {}); // host re-broadcasts who has answered
 
   const clearSessionTimers = () => {
     if (hostRef.current.evalTimeout) clearTimeout(hostRef.current.evalTimeout);
+    if (hostRef.current.revealTimeout) clearTimeout(hostRef.current.revealTimeout);
     if (joinTimerRef.current) clearInterval(joinTimerRef.current);
     pingTimersRef.current.forEach(clearTimeout);
     pingTimersRef.current = [];
@@ -126,6 +135,8 @@ function GameLoop() {
     setScores({});
     setStreaks({});
     setEarned({});
+    setDetail({});
+    setToasts([]);
     setRevealSong(null);
     setCorrectIds([]);
     setHostLeft(false);
@@ -146,6 +157,12 @@ function GameLoop() {
     setPlayerId(pid);
     setAdapter(newAdapter);
     return newAdapter;
+  };
+
+  const pushToast = (name: string, avatar?: string) => {
+    const id = Date.now() + Math.random();
+    setToasts(t => [...t.slice(-2), { id, name, avatar }]);
+    window.setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 3800);
   };
 
   const commitPlayers = (list: Player[]) => {
@@ -194,7 +211,7 @@ function GameLoop() {
     if (!adapter) return;
 
     const hs = () => hostRef.current;
-    const activePlayers = () => playersRef.current.filter(p => p.id !== HOST_ID);
+    const activePlayers = () => playersRef.current; // the host plays too
 
     const applyRoundEnd = (payload: any) => {
       audioRef.current?.pause();
@@ -202,6 +219,7 @@ function GameLoop() {
       setScores(payload.scores);
       setStreaks(payload.streaks);
       setEarned(payload.earned ?? {});
+      setDetail(payload.detail ?? {});
       setRevealSong(payload.song ?? null);
       setCorrectIds(payload.correctPlayers ?? []);
       setGameState('REVEAL');
@@ -215,21 +233,26 @@ function GameLoop() {
       h.roundOpen = false;
       if (h.evalTimeout) clearTimeout(h.evalTimeout);
       h.evalTimeout = null;
+      if (h.revealTimeout) clearTimeout(h.revealTimeout);
+      h.revealTimeout = null;
 
       const round = h.rounds[h.roundNo - 1];
       const earnedNow: Record<string, number> = {};
+      const detailNow: Record<string, RoundDetail> = {};
       const correctPlayers: string[] = [];
 
       activePlayers().forEach(p => {
         const answer = h.answers.get(p.id);
         if (answer && answer.optionIndex === round.correctIndex) {
           const streak = (h.streaks[p.id] || 0) + 1;
-          const timeBonus = Math.max(0, ((h.roundMs - answer.tMs) / h.roundMs) * 600);
-          const streakBonus = Math.min(streak * 50, 250);
-          const points = Math.floor(400 + timeBonus + streakBonus);
+          // Faster answers earn more: the speed share shrinks linearly as the timer runs down
+          const speed = Math.round(Math.max(0, 1 - answer.tMs / h.roundMs) * SCORE_SPEED);
+          const streakBonus = Math.min(streak * STREAK_STEP, STREAK_CAP);
+          const points = SCORE_BASE + speed + streakBonus;
           h.scores[p.id] = (h.scores[p.id] || 0) + points;
           h.streaks[p.id] = streak;
           earnedNow[p.id] = points;
+          detailNow[p.id] = { base: SCORE_BASE, speed, streak: streakBonus, tMs: answer.tMs };
           correctPlayers.push(p.id);
         } else {
           h.streaks[p.id] = 0;
@@ -242,6 +265,7 @@ function GameLoop() {
         scores: { ...h.scores },
         streaks: { ...h.streaks },
         earned: earnedNow,
+        detail: detailNow,
         correctPlayers,
         song: { title: round.song.title, artist: round.song.artist, artwork: round.song.artwork }
       };
@@ -249,16 +273,32 @@ function GameLoop() {
       applyRoundEnd(payload); // the host never receives its own broadcast
     };
 
-    const checkAllAnswered = () => {
+    const progressPayload = (): AnswerInfo => {
       const h = hs();
-      if (!h.roundOpen) return;
-      const total = activePlayers().length;
-      const count = activePlayers().filter(p => h.answers.has(p.id)).length;
-      const progress = { count, total };
-      setAnswerProgress(progress);
-      adapter.broadcast('answer_progress', progress);
+      const answered = activePlayers()
+        .filter(p => h.answers.has(p.id))
+        .map(p => ({ id: p.id, at: h.answers.get(p.id)!.tMs }));
+      const info: AnswerInfo = { count: answered.length, total: activePlayers().length, answered };
+      // Who picked what stays hidden until the last quarter of the timer
+      if (Date.now() >= h.startAt + h.roundMs * REVEAL_PICKS_AT - 50) {
+        info.picks = {};
+        answered.forEach(x => { info.picks![x.id] = h.answers.get(x.id)!.optionIndex; });
+      }
+      return info;
+    };
+
+    const sendProgress = () => {
+      if (!hs().roundOpen) return null;
+      const info = progressPayload();
+      setAnswerProgress(info);
+      adapter.broadcast('answer_progress', info);
+      return info;
+    };
+
+    const checkAllAnswered = () => {
+      const info = sendProgress();
       // Everyone is in: end the round shortly instead of waiting out the timer
-      if (total > 0 && count >= total) window.setTimeout(evaluateRound, 800);
+      if (info && info.total > 0 && info.count >= info.total) window.setTimeout(evaluateRound, 800);
     };
 
     const handleJoin = (p: any) => {
@@ -288,20 +328,23 @@ function GameLoop() {
       checkAllAnswered();
     };
 
-    const handleAnswer = (p: any) => {
-      if (!isHost) return;
+    const recordAnswer = (id: string, optionIndex: unknown) => {
       const h = hs();
-      if (!h.roundOpen || h.answers.has(p?.playerId)) return;
-      if (!activePlayers().some(x => x.id === p.playerId)) return;
+      if (!h.roundOpen || h.answers.has(id)) return;
+      if (!activePlayers().some(x => x.id === id)) return;
       const round = h.rounds[h.roundNo - 1];
-      const idx = Number(p.optionIndex);
+      const idx = Number(optionIndex);
       if (!Number.isInteger(idx) || idx < 0 || idx >= round.options.length) return;
 
       // Time is measured by the host on arrival, so a client can't claim a faster answer
       const now = Date.now();
       if (now < h.startAt - 500 || now > h.startAt + h.roundMs + ANSWER_GRACE_MS) return;
-      h.answers.set(p.playerId, { optionIndex: idx, tMs: Math.min(h.roundMs, Math.max(0, now - h.startAt)) });
+      h.answers.set(id, { optionIndex: idx, tMs: Math.min(h.roundMs, Math.max(0, now - h.startAt)) });
       checkAllAnswered();
+    };
+
+    const handleAnswer = (p: any) => {
+      if (isHost) recordAnswer(p?.playerId, p?.optionIndex);
     };
 
     const handleTimePing = (p: any) => {
@@ -365,6 +408,10 @@ function GameLoop() {
       setGameState('END');
     };
 
+    const handlePlayerLeft = (p: any) => {
+      if (!isHost) pushToast(String(p?.name ?? 'Player'), p?.avatar);
+    };
+
     const handleHostLeft = () => {
       if (!isHost) {
         clearSessionTimers();
@@ -378,7 +425,7 @@ function GameLoop() {
       time_pong: handleTimePong, roster_update: handleRosterUpdate, join_rejected: handleJoinRejected,
       game_start: handleGameStart, round_start: handleRoundStart, round_end: handleRoundEnd,
       show_leaderboard: handleShowLeaderboard, answer_progress: handleAnswerProgress,
-      final: handleFinal, host_left: handleHostLeft
+      final: handleFinal, host_left: handleHostLeft, player_left: handlePlayerLeft
     };
     Object.entries(handlers).forEach(([event, fn]) => adapter.on(event, fn));
 
@@ -391,6 +438,8 @@ function GameLoop() {
 
     // Exposed so the host buttons/timers use the same closure as the network handlers
     evaluateRef.current = evaluateRound;
+    answerRef.current = recordAnswer;
+    progressRef.current = () => { sendProgress(); };
 
     return () => {
       window.removeEventListener('pagehide', onPageHide);
@@ -410,6 +459,7 @@ function GameLoop() {
     setCorrectIndex(null);
     setAnswerProgress(null);
     setEarned({});
+    setDetail({});
     setCorrectIds([]);
     setTimeFrac(1);
     setTimeLeft(p.seconds);
@@ -436,16 +486,20 @@ function GameLoop() {
     };
     adapterRef.current?.broadcast('round_start', payload);
     beginRound(payload);
-    setAnswerProgress({ count: 0, total: playersRef.current.filter(p => p.id !== HOST_ID).length });
+    setAnswerProgress({ count: 0, total: playersRef.current.length, answered: [] });
 
     // Timer lives on the host clock; the grace window lets in-flight answers land
     if (h.evalTimeout) clearTimeout(h.evalTimeout);
     h.evalTimeout = window.setTimeout(() => evaluateRef.current(), COUNTDOWN_MS + h.roundMs + ANSWER_GRACE_MS);
+
+    // Reveal everyone's picks once ~25% of the timer is left
+    if (h.revealTimeout) clearTimeout(h.revealTimeout);
+    h.revealTimeout = window.setTimeout(() => progressRef.current(), COUNTDOWN_MS + h.roundMs * REVEAL_PICKS_AT);
   };
 
   const hostStartGame = (playlist: Song[], pool: Song[], settings: GameSettings) => {
-    const others = playersRef.current.filter(p => p.id !== HOST_ID);
-    if (others.length < 1 || playlist.length === 0) return;
+    const everyone = playersRef.current; // the host plays too, so solo games work
+    if (everyone.length < 1 || playlist.length === 0) return;
 
     const h = hostRef.current;
     h.rounds = buildRounds(playlist.slice(0, settings.rounds), pool, settings);
@@ -453,7 +507,7 @@ function GameLoop() {
     h.started = true;
     h.scores = {};
     h.streaks = {};
-    others.forEach(p => { h.scores[p.id] = 0; h.streaks[p.id] = 0; });
+    everyone.forEach(p => { h.scores[p.id] = 0; h.streaks[p.id] = 0; });
 
     setScores({});
     setStreaks({});
@@ -525,9 +579,10 @@ function GameLoop() {
   }, [gameState, currentRound]);
 
   const handleClientAnswer = (idx: number) => {
-    if (isHost || gameState !== 'PLAYING' || selectedAnswerIdx !== null) return;
+    if (gameState !== 'PLAYING' || selectedAnswerIdx !== null) return;
     setSelectedAnswerIdx(idx);
-    adapterRef.current?.broadcast('answer', { playerId, optionIndex: idx });
+    if (isHost) answerRef.current(HOST_ID, idx); // the host never receives its own broadcast
+    else adapterRef.current?.broadcast('answer', { playerId, optionIndex: idx });
   };
 
   // ---------------- RENDER ----------------
@@ -558,19 +613,20 @@ function GameLoop() {
     content = (
       <PlayingScreen
         round={currentRound}
+        roundSeconds={currentRound.seconds}
         total={totalRounds}
         timeLeft={timeLeft}
         timeFrac={timeFrac}
         selected={selectedAnswerIdx}
-        isHost={isHost}
+        playerId={playerId}
+        players={players}
         score={scores[playerId] || 0}
         streak={streaks[playerId] || 0}
-        answered={answerProgress}
+        answerInfo={answerProgress}
         onAnswer={handleClientAnswer}
       />
     );
   } else if (gameState === 'REVEAL' && currentRound && correctIndex !== null) {
-    const nonHost = players.filter(p => p.id !== HOST_ID);
     content = (
       <RevealScreen
         key={currentRound.roundNo}
@@ -583,9 +639,9 @@ function GameLoop() {
         song={revealSong}
         score={scores[playerId] || 0}
         earned={earned[playerId] || 0}
+        detail={detail[playerId]}
         streak={streaks[playerId] || 0}
         correctPlayers={players.filter(p => correctIds.includes(p.id))}
-        respondents={nonHost.length}
         onContinue={hostNextStep}
       />
     );
@@ -609,6 +665,7 @@ function GameLoop() {
     <>
       <TopBar inRoom={!!roomCode && !hostLeft} isHost={isHost} onExit={() => exitGame()} />
       {content}
+      <Toasts toasts={toasts} />
     </>
   );
 }

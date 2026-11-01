@@ -41,6 +41,13 @@ export const COUNTDOWN_MS = 3000;
 /** How long the host keeps accepting answers after the timer hits zero (network latency) */
 export const ANSWER_GRACE_MS = 1200;
 export const MAX_PLAYERS = 12;
+/** Scoring: a flat base, a speed share that shrinks as the timer runs down, and a capped streak bonus */
+export const SCORE_BASE = 300;
+export const SCORE_SPEED = 700;
+export const STREAK_STEP = 50;
+export const STREAK_CAP = 250;
+/** Other players' picks become visible when this fraction of the round has elapsed (25% left) */
+export const REVEAL_PICKS_AT = 0.75;
 
 export function shuffle<T>(items: T[]): T[] {
   const a = [...items];

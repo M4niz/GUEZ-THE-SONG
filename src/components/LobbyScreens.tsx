@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect } from 'react';
-import { LogIn, Plus, Search, Play, Square, X, Check, Copy, Shuffle, Loader, RotateCcw, Music } from 'lucide-react';
+import { Plus, Search, Play, Square, X, Check, Copy, Shuffle, Loader, RotateCcw } from 'lucide-react';
 import { AVATARS } from '../data/avatars';
 import { Avatar } from './Avatar';
+import { PixelBackdrop, PixelSprite } from './PixelArt';
 import {
   CHOICE_OPTIONS, DEFAULT_SETTINGS, LANGUAGES, MAX_ARTISTS, ROUND_OPTIONS, SECONDS_OPTIONS,
   buildAutoPlaylist, searchArtists, searchItunes
@@ -233,9 +234,11 @@ export function LobbyScreens({
 
   if (view === 'HOME') {
     return (
-      <div className="page page-center">
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: '96px', height: '96px', backgroundColor: 'var(--green)', borderRadius: '32px', color: 'white', borderBottom: '6px solid var(--green-dark)' }}>
-          <Music size={50} />
+      <>
+      <PixelBackdrop />
+      <div className="page page-center" style={{ position: 'relative', zIndex: 1 }}>
+        <div className="logo-box">
+          <PixelSprite name="cd" size={80} className="px-spin" />
         </div>
         <h1 className="text-h1" style={{ color: 'var(--green-text)' }}>Guess the Song</h1>
 
@@ -248,19 +251,22 @@ export function LobbyScreens({
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', width: '100%', maxWidth: '320px' }}>
           <button className="btn" onClick={handleHostClick}>
-            <Plus size={20} /> Create room
+            Create room
           </button>
           <button className="btn blue" onClick={() => { setIsHostForm(false); setView('JOIN'); }}>
-            <LogIn size={20} /> Join room
+            Join room
           </button>
         </div>
       </div>
+      </>
     );
   }
 
   if (view === 'JOIN') {
     return (
-      <div className="page page-center">
+      <>
+      <PixelBackdrop />
+      <div className="page page-center" style={{ position: 'relative', zIndex: 1 }}>
         <h1 className="text-h1" style={{ color: 'var(--blue-text)' }}>
           {isHostForm ? 'Create Room' : 'Join Room'}
         </h1>
@@ -325,13 +331,13 @@ export function LobbyScreens({
           </button>
         </form>
       </div>
+      </>
     );
   }
 
   // ---------------- LOBBY ----------------
-  const needMorePlayers = players.length < 2;
   const startDisabled =
-    needMorePlayers || autoLoading ||
+    autoLoading ||
     (mode === 'pick' ? playlist.length !== settings.rounds : artists.length === 0 && autoLang === 'any');
 
   return (
@@ -537,8 +543,8 @@ export function LobbyScreens({
           </div>
 
           <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '10px', paddingTop: '8px' }}>
-            {needMorePlayers && (
-              <div className="hint-note" style={{ textAlign: 'center', margin: 0 }}>Waiting for at least one player to join…</div>
+            {players.length < 2 && (
+              <div className="hint-note" style={{ textAlign: 'center', margin: 0 }}>Playing solo? Start any time, or wait for friends to join.</div>
             )}
             <button className="btn" onClick={handleStart} disabled={startDisabled} style={{ width: '100%' }}>
               {autoLoading ? 'Finding songs…' : mode === 'auto' ? 'Shuffle & start' : 'Start game'}

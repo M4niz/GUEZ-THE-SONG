@@ -26,6 +26,8 @@ main.tsx -> App.tsx -> components/GameLoop.tsx   state machine, host logic, netw
                          |- TopBar.tsx           theme toggle (top right) + exit button/confirm modal (top left, in-room only)
                          |- LobbyScreens.tsx     home / join / lobby; host setup tabs "Pick songs", "Artists" (as-you-type artist dropdown, multi-select) and "Settings"
                          `- GameScreens.tsx      Countdown, Playing, Reveal, Leaderboard, End (podium), HostLeft (presentational)
+components/PixelArt.tsx   original 8-bit sprites (vinyl, cd, note) drawn from character grids + PixelBackdrop for the home screen
+components/Toasts.tsx    leave toasts
 components/Effects.tsx   Confetti, XpBadge (points gather + count-up), StreakBadge (flame)
 components/Avatar.tsx    data/avatars.ts
 utils/songs.ts           constants, iTunes search, buildAutoPlaylist, buildRounds, shuffle
@@ -36,10 +38,10 @@ utils/theme.ts           useTheme
 data/songs.json          sample songs; NOT imported anywhere (dead data)
 ```
 
-**Host-authoritative model.** The host's browser owns the game. Clients send `join`, `leave`, `answer`, `time_ping`. The host sends `roster_update`, `join_rejected`, `game_start`, `round_start`, `answer_progress`, `round_end`, `show_leaderboard`, `final`, `time_pong`, `host_left`. The host is player id `'HOST'`, does not compete (spectator view, not on the leaderboard), and does not receive its own broadcasts, so every host transition is applied locally *and* broadcast (`applyRoundEnd`, `beginRound`).
+**Host-authoritative model.** The host's browser owns the game. Clients send `join`, `leave`, `answer`, `time_ping`. The host sends `roster_update`, `join_rejected`, `game_start`, `round_start`, `answer_progress`, `player_left`, `round_end`, `show_leaderboard`, `final`, `time_pong`, `host_left`. The host is player id `'HOST'` and plays like everyone else (scored, on the leaderboard, solo games work), but does not receive its own broadcasts, so every host transition is applied locally *and* broadcast (`applyRoundEnd`, `beginRound`).
 
 **State machine:** `LOBBY -> COUNTDOWN -> PLAYING -> REVEAL -> LEADERBOARD -> (COUNTDOWN | END)`.
-- Every device (host included) runs the same timeline from `round_start.startAt`, a host wall-clock time. Clients convert it to local time with an offset from a `time_ping`/`time_pong` exchange (lowest-RTT sample). COUNTDOWN preloads the clip and flips to PLAYING at `startAt`; the timer bar counts down to `startAt + 15s`.
+- Every device (host included) runs the same timeline from `round_start.startAt`, a host wall-clock time. Clients convert it to local time with an offset from a `time_ping`/`time_pong` exchange (lowest-RTT sample). COUNTDOWN preloads the clip and flips to PLAYING at `startAt`; the timer bar counts down to `startAt + round length`.
 - The host evaluates a round when the timer + grace window expires (`hostRef.evalTimeout`) or as soon as every player has answered. Answer time is measured by the host on arrival, not reported by the client. Only the first valid answer per player counts.
 - Network callbacks and timers read refs (`adapterRef`, `playersRef`, `hostRef`, `clockRef`), never React state, to avoid stale closures. Keep it that way.
 - Answers are not leaked ahead of time: `round_start` carries options and the clip URL only; title/artist/artwork arrive in `round_end`.
@@ -48,7 +50,11 @@ data/songs.json          sample songs; NOT imported anywhere (dead data)
 
 **Round building.** `buildRounds(playlist, pool)` picks `title` or `artist` per round with `choices - 1` distractors from `pool` (normalized, so no duplicate or look-alike options; falls back to the other type if it can't find 3). "Pick songs" mode uses the 5 chosen songs as the pool. "Artists" mode calls `buildAutoPlaylist(artistNames, language, rounds)`: it searches iTunes once per selected artist (up to 50 each, `country=IN`; artist names come from `searchArtists`, entity=musicArtist), drops karaoke/remix/cover-style tracks, dedupes titles, filters by artist and by iTunes *genre* for language (there is no language field), shuffles, takes `rounds` songs, and keeps the whole pool for distractors.
 
-**Scoring** (`evaluateRound`): 400 base + up to 600 time bonus + streak bonus (50 per consecutive correct including this one, max 250).
+**Scoring** (`evaluateRound`, constants in `utils/songs.ts`): 300 base + up to 700 speed bonus (linear in how early the host received the answer) + streak bonus (50 per consecutive correct including this one, max 250). `round_end.detail` carries the per-player breakdown shown on the reveal sheet.
+
+**Live answer info.** `answer_progress` carries `{count,total,answered:[{id,at}],picks?}`. Avatars appear on the timer bar at the moment each player locks in. `picks` (who chose which option) is only included once `REVEAL_PICKS_AT` (75% elapsed, i.e. 25% left) has passed; the host re-broadcasts at that moment via `progressRef`.
+
+**Toasts.** When the host handles a `leave` it shows a bottom-left "[avatar] name left" toast and broadcasts `player_left` so clients show it too.
 
 **Audio.** One shared `<audio>` element (`audioRef`) is created by `unlockAudio()` inside the Create/Join click and reused for every round (iOS autoplay). `unlockAudio` also resumes the singleton AudioContext used for the sound effects. Keep reusing that element.
 
