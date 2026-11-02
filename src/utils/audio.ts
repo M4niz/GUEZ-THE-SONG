@@ -1,3 +1,20 @@
+const MUTE_KEY = 'guess-the-song:muted';
+let muted = (() => {
+  try { return localStorage.getItem(MUTE_KEY) === '1'; } catch { return false; }
+})();
+const muteListeners = new Set<() => void>();
+
+export const isMuted = () => muted;
+export function setMuted(value: boolean) {
+  muted = value;
+  try { localStorage.setItem(MUTE_KEY, value ? '1' : '0'); } catch { /* storage unavailable */ }
+  muteListeners.forEach(l => l());
+}
+export function subscribeMuted(listener: () => void) {
+  muteListeners.add(listener);
+  return () => { muteListeners.delete(listener); };
+}
+
 // Singleton AudioContext to prevent exceeding browser limits
 let audioCtx: AudioContext | null = null;
 
@@ -38,6 +55,7 @@ export function vibrate(pattern: number | number[]) {
 }
 
 export function playCorrectTone() {
+  if (muted) return;
   try {
     const ctx = getAudioContext();
 
@@ -65,6 +83,7 @@ export function playCorrectTone() {
 }
 
 export function playWrongTone() {
+  if (muted) return;
   try {
     const ctx = getAudioContext();
 
@@ -92,6 +111,7 @@ export function playWrongTone() {
 
 /** Quick rising arpeggio for the "points gathered" moment */
 export function playCoinTone(count = 3) {
+  if (muted) return;
   try {
     const ctx = getAudioContext();
     for (let i = 0; i < count; i++) {
@@ -108,6 +128,27 @@ export function playCoinTone(count = 3) {
       osc.start(t);
       osc.stop(t + 0.13);
     }
+  } catch (e) {
+    console.error("Audio playback error:", e);
+  }
+}
+
+/** Short click for the last seconds of a round */
+export function playTickTone() {
+  if (muted) return;
+  try {
+    const ctx = getAudioContext();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(1200, ctx.currentTime);
+    gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+    gain.gain.linearRampToValueAtTime(0.08, ctx.currentTime + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.06);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.07);
   } catch (e) {
     console.error("Audio playback error:", e);
   }

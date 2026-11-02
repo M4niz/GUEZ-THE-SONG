@@ -5,7 +5,7 @@ import { Avatar } from './Avatar';
 import { PixelBackdrop, PixelSprite } from './PixelArt';
 import {
   CHOICE_OPTIONS, DEFAULT_SETTINGS, LANGUAGES, MAX_ARTISTS, ROUND_OPTIONS, SECONDS_OPTIONS,
-  buildAutoPlaylist, searchArtists, searchItunes
+  SURPRISE_ARTISTS, buildAutoPlaylist, searchArtists, searchItunes, shuffle
 } from '../utils/songs';
 import type { ArtistHit, GameSettings, RoundTypes, Song } from '../utils/songs';
 
@@ -18,6 +18,23 @@ interface LobbyScreensProps {
   onStartHostGame: (playlist: Song[], pool: Song[], settings: GameSettings) => void;
   notice: string | null;
   onDismissNotice: () => void;
+}
+
+const SETTINGS_KEY = 'guess-the-song:settings';
+
+/** Last-used settings, validated against the allowed options */
+function loadSettings(): GameSettings {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? 'null');
+    if (raw
+      && ROUND_OPTIONS.includes(raw.rounds)
+      && SECONDS_OPTIONS.includes(raw.roundSeconds)
+      && CHOICE_OPTIONS.includes(raw.choices)
+      && ['mixed', 'title', 'artist'].includes(raw.roundTypes)) {
+      return raw as GameSettings;
+    }
+  } catch { /* fall through to defaults */ }
+  return DEFAULT_SETTINGS;
 }
 
 type SetupMode = 'pick' | 'auto';
@@ -53,7 +70,7 @@ export function LobbyScreens({
   onDismissNotice
 }: LobbyScreensProps) {
 
-  const [view, setView] = useState<'HOME' | 'JOIN' | 'LOBBY'>('HOME');
+  const [view, setView] = useState<'HOME' | 'JOIN' | 'LOBBY'>(roomCode ? 'LOBBY' : 'HOME'); // roomCode is set when resuming or playing again
   const [joinCode, setJoinCode] = useState('');
   const [joinName, setJoinName] = useState('');
   const [selectedAvatar, setSelectedAvatar] = useState('cat');
@@ -63,7 +80,7 @@ export function LobbyScreens({
   // Host setup
   const [tab, setTab] = useState<SetupTab>('pick');
   const [mode, setMode] = useState<SetupMode>('pick'); // which song source Start uses
-  const [settings, setSettings] = useState<GameSettings>(DEFAULT_SETTINGS);
+  const [settings, setSettings] = useState<GameSettings>(loadSettings);
   const [searchTerm, setSearchTerm] = useState('');
   const [searchResults, setSearchResults] = useState<Song[]>([]);
   const [isSearching, setIsSearching] = useState(false);
@@ -91,6 +108,10 @@ export function LobbyScreens({
       }
     };
   }, []);
+
+  useEffect(() => {
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch { /* storage unavailable */ }
+  }, [settings]);
 
   // Search artists as the host types (debounced; late responses are ignored)
   useEffect(() => {
@@ -198,6 +219,22 @@ export function LobbyScreens({
       onStartHostGame(picked, pool, settings);
     } catch (err) {
       setAutoError(err instanceof Error ? err.message : 'Something went wrong. Try again.');
+    }
+    setAutoLoading(false);
+  };
+
+  const handleSurprise = async () => {
+    stopPreview();
+    setAutoLoading(true);
+    setAutoError(null);
+    try {
+      const picks = shuffle(SURPRISE_ARTISTS).slice(0, 3);
+      const { playlist: picked, pool } = await buildAutoPlaylist(picks, 'any', settings.rounds);
+      onStartHostGame(picked, pool, settings);
+    } catch (err) {
+      setAutoError(err instanceof Error ? err.message : 'Something went wrong. Try again.');
+      setTab('auto');
+      setMode('auto');
     }
     setAutoLoading(false);
   };
@@ -548,6 +585,9 @@ export function LobbyScreens({
             )}
             <button className="btn" onClick={handleStart} disabled={startDisabled} style={{ width: '100%' }}>
               {autoLoading ? 'Finding songs…' : mode === 'auto' ? 'Shuffle & start' : 'Start game'}
+            </button>
+            <button className="btn gray" onClick={handleSurprise} disabled={autoLoading} style={{ width: '100%' }}>
+              <Shuffle size={18} /> Surprise me
             </button>
           </div>
         </>

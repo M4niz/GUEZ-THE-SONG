@@ -37,6 +37,11 @@ export const ROUND_OPTIONS = [3, 5, 8, 10, 15];
 export const SECONDS_OPTIONS = [10, 15, 20, 30]; // previews are 30 s long
 export const CHOICE_OPTIONS = [2, 3, 4, 5, 6];
 export const MAX_ARTISTS = 5;
+/** Pool for the "Surprise me" button */
+export const SURPRISE_ARTISTS = [
+  'A.R. Rahman', 'Anirudh Ravichander', 'Arijit Singh', 'Sid Sriram', 'Shreya Ghoshal', 'Yuvan Shankar Raja',
+  'Harris Jayaraj', 'Sonu Nigam', 'Badshah', 'Ed Sheeran', 'Taylor Swift', 'Coldplay'
+];
 export const COUNTDOWN_MS = 3000;
 /** How long the host keeps accepting answers after the timer hits zero (network latency) */
 export const ANSWER_GRACE_MS = 1200;

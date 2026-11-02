@@ -3,7 +3,7 @@ import { Check, Flame, Music, Trophy, X, Zap } from 'lucide-react';
 import { Avatar } from './Avatar';
 import { Confetti, StreakBadge, XpBadge } from './Effects';
 import type { Row } from '../utils/ranking';
-import { playCoinTone, playCorrectTone, playWrongTone, vibrate } from '../utils/audio';
+import { playCoinTone, playCorrectTone, playTickTone, playWrongTone, vibrate } from '../utils/audio';
 
 export interface Player {
   id: string;
@@ -103,6 +103,11 @@ export function PlayingScreen({ round, roundSeconds, total, timeLeft, timeFrac, 
   const timerColor = timeFrac <= 0.33 ? 'var(--red)' : timeFrac <= 0.55 ? 'var(--yellow)' : 'var(--green)';
   const locked = selected !== null;
   const picks = answerInfo?.picks;
+
+  // Tick during the last three seconds
+  useEffect(() => {
+    if (timeLeft > 0 && timeLeft <= 3) playTickTone();
+  }, [timeLeft]);
 
   // Other players' picks only appear once ~25% of the timer is left
   const pickersFor = (idx: number) =>
@@ -342,7 +347,7 @@ const PODIUM = [
   { place: 3, height: 95, color: 'var(--orange)' }
 ];
 
-export function EndScreen({ rows, playerId, onHome }: { rows: Row[]; playerId: string; onHome: () => void }) {
+export function EndScreen({ rows, playerId, onHome, onAgain }: { rows: Row[]; playerId: string; onHome: () => void; onAgain?: () => void }) {
   // visual order: 2nd, 1st, 3rd
   const slots = [rows[1], rows[0], rows[2]].map((row, i) => ({ row, ...PODIUM[[1, 0, 2][i]] }));
   const iWon = rows[0]?.id === playerId;
@@ -370,7 +375,8 @@ export function EndScreen({ rows, playerId, onHome }: { rows: Row[]; playerId: s
         </div>
       )}
 
-      <button className="btn" onClick={onHome} style={{ width: '100%', maxWidth: '400px' }}>Back to home</button>
+      {onAgain && <button className="btn" onClick={onAgain} style={{ width: '100%', maxWidth: '400px' }}>Play again</button>}
+      <button className={onAgain ? 'btn gray' : 'btn'} onClick={onHome} style={{ width: '100%', maxWidth: '400px' }}>Back to home</button>
     </div>
   );
 }

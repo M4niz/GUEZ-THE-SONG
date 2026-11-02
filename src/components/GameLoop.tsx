@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useSyncExternalStore } from 'react';
 import { LobbyScreens } from './LobbyScreens';
 import { Toasts } from './Toasts';
 import type { Toast } from './Toasts';
@@ -9,7 +9,7 @@ import {
 import type { AnswerInfo, Player, RevealSong, RoundDetail, RoundInfo } from './GameScreens';
 import { rankPlayers } from '../utils/ranking';
 import RealtimeAdapter from '../utils/realtime';
-import { unlockAudio } from '../utils/audio';
+import { isMuted, subscribeMuted, unlockAudio } from '../utils/audio';
 import {
   ANSWER_GRACE_MS, COUNTDOWN_MS, MAX_PLAYERS, REVEAL_PICKS_AT, ROUND_SECONDS, SCORE_BASE, SCORE_SPEED,
   STREAK_CAP, STREAK_STEP, TOTAL_ROUNDS, buildRounds
@@ -19,6 +19,19 @@ import type { GameSettings, HostRound, Song } from '../utils/songs';
 type GameState = 'LOBBY' | 'COUNTDOWN' | 'PLAYING' | 'REVEAL' | 'LEADERBOARD' | 'END';
 
 const HOST_ID = 'HOST';
+const SESSION_KEY = 'guess-the-song:session';
+
+interface SavedSession { code: string; pid: string; name: string; avatar: string }
+
+// A joiner's identity survives a refresh (sessionStorage is per tab) so they can rejoin with their score
+const saveSession = (s: SavedSession) => { try { sessionStorage.setItem(SESSION_KEY, JSON.stringify(s)); } catch { /* storage unavailable */ } };
+const clearSession = () => { try { sessionStorage.removeItem(SESSION_KEY); } catch { /* storage unavailable */ } };
+const loadSession = (): SavedSession | null => {
+  try {
+    const s = JSON.parse(sessionStorage.getItem(SESSION_KEY) ?? 'null');
+    return s && s.code && s.pid && s.name ? s : null;
+  } catch { return null; }
+};
 
 interface ActiveRound extends RoundInfo {
   /** Host wall-clock time (ms) at which the clip starts and the timer begins */
@@ -38,11 +51,13 @@ interface HostState {
   streaks: Record<string, number>;
   evalTimeout: number | null;
   revealTimeout: number | null;
+  /** The last round_start payload, replayed to a player who rejoins mid-round */
+  lastRound: any | null;
 }
 
 const freshHostState = (): HostState => ({
   rounds: [], roundNo: 0, started: false, roundOpen: false, startAt: 0, roundMs: ROUND_SECONDS * 1000,
-  answers: new Map(), scores: {}, streaks: {}, evalTimeout: null, revealTimeout: null
+  answers: new Map(), scores: {}, streaks: {}, evalTimeout: null, revealTimeout: null, lastRound: null
 });
 
 const generateRoomCode = () => {
@@ -94,6 +109,13 @@ function GameLoop() {
   const evaluateRef = useRef<() => void>(() => {}); // host round-evaluation, set by the handlers effect
   const answerRef = useRef<(id: string, optionIndex: number) => void>(() => {}); // host records an answer (also used for the host's own)
   const progressRef = useRef<() => void>(() => {}); // host re-broadcasts who has answered
+  const resumedRef = useRef(false);
+  const muted = useSyncExternalStore(subscribeMuted, isMuted);
+
+  // Mute applies to the clip too
+  useEffect(() => {
+    if (audioRef.current) audioRef.current.muted = muted;
+  }, [muted]);
 
   const clearSessionTimers = () => {
     if (hostRef.current.evalTimeout) clearTimeout(hostRef.current.evalTimeout);
@@ -120,6 +142,7 @@ function GameLoop() {
     adapterRef.current = null;
     roleRef.current = { isHost: false, playerId: '' };
 
+    clearSession();
     setAdapter(null);
     setIsHost(false);
     setRoomCode(null);
@@ -151,6 +174,8 @@ function GameLoop() {
     // Must run inside the click that created/joined the room
     audioRef.current = unlockAudio();
 
+    newAdapter.on('system_connected', () => newAdapter.track({ playerId: pid }));
+
     setNotice(null);
     setIsHost(host);
     setRoomCode(code);
@@ -179,9 +204,10 @@ function GameLoop() {
     setPlayers([me]);
   };
 
-  const handleJoinLobby = (code: string, name: string, avatar: string) => {
-    const pid = `P_${Math.random().toString(36).slice(2, 11)}`;
+  const handleJoinLobby = (code: string, name: string, avatar: string, existingId?: string) => {
+    const pid = existingId ?? `P_${Math.random().toString(36).slice(2, 11)}`;
     const newAdapter = startSession(code, pid, false);
+    saveSession({ code, pid, name, avatar });
     clockRef.current = { offset: 0, bestRtt: Infinity };
 
     const sendJoin = () => newAdapter.broadcast('join', { playerId: pid, name, avatar });
@@ -203,6 +229,38 @@ function GameLoop() {
         }
       }, 2500);
     });
+  };
+
+  // Rejoin the room after a refresh
+  useEffect(() => {
+    if (resumedRef.current) return;
+    resumedRef.current = true;
+    const saved = loadSession();
+    if (saved) handleJoinLobby(saved.code, saved.name, saved.avatar, saved.pid);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** Clears everything round-related (used when the host starts another game with the same players) */
+  const resetRoundState = () => {
+    setCurrentRound(null);
+    setCurrentSong(null);
+    setSelectedAnswerIdx(null);
+    setAnswerProgress(null);
+    setCorrectIndex(null);
+    setScores({});
+    setStreaks({});
+    setEarned({});
+    setDetail({});
+    setRevealSong(null);
+    setCorrectIds([]);
+  };
+
+  const hostPlayAgain = () => {
+    clearSessionTimers();
+    hostRef.current = freshHostState();
+    adapterRef.current?.broadcast('play_again', {});
+    resetRoundState();
+    setGameState('LOBBY');
   };
 
   // ---------------- NETWORK HANDLERS ----------------
@@ -304,11 +362,14 @@ function GameLoop() {
     const handleJoin = (p: any) => {
       if (!isHost || !p?.playerId || p.playerId === HOST_ID) return;
       const list = playersRef.current;
+      // A player we already scored this game is allowed back in after a refresh
+      const known = Object.prototype.hasOwnProperty.call(hs().scores, p.playerId);
       if (list.some(x => x.id === p.playerId)) {
         adapter.broadcast('roster_update', { players: list }); // lets a retrying joiner in
+        if (hs().started) sendSync(p.playerId);
         return;
       }
-      if (hs().started) {
+      if (hs().started && !known) {
         adapter.broadcast('join_rejected', { playerId: p.playerId, reason: 'That game has already started.' });
         return;
       }
@@ -316,15 +377,34 @@ function GameLoop() {
         adapter.broadcast('join_rejected', { playerId: p.playerId, reason: 'That room is full.' });
         return;
       }
-      hs().scores[p.playerId] = 0;
-      hs().streaks[p.playerId] = 0;
+      if (!known) {
+        hs().scores[p.playerId] = 0;
+        hs().streaks[p.playerId] = 0;
+      }
       commitPlayers([...list, { id: p.playerId, name: String(p.name ?? 'Player').slice(0, 15), avatar: p.avatar }]);
+      if (hs().started) sendSync(p.playerId);
+    };
+
+    /** Brings a rejoining player back to the current round with their score */
+    const sendSync = (id: string) => {
+      const h = hs();
+      adapter.broadcast('state_sync', {
+        to: id,
+        total: h.rounds.length,
+        scores: { ...h.scores },
+        streaks: { ...h.streaks },
+        round: h.roundOpen ? h.lastRound : null,
+        answer: h.answers.get(id)?.optionIndex ?? null
+      });
     };
 
     const handleLeave = (p: any) => {
       if (!isHost || !p?.playerId) return;
-      if (!playersRef.current.some(x => x.id === p.playerId)) return;
+      const leaver = playersRef.current.find(x => x.id === p.playerId);
+      if (!leaver || leaver.id === HOST_ID) return;
       commitPlayers(playersRef.current.filter(x => x.id !== p.playerId));
+      pushToast(leaver.name, leaver.avatar);
+      adapter.broadcast('player_left', { name: leaver.name, avatar: leaver.avatar });
       checkAllAnswered();
     };
 
@@ -376,6 +456,25 @@ function GameLoop() {
       if (!isHost && p.playerId === playerId) exitGame(p.reason ?? 'Could not join that room.', false);
     };
 
+    const handleStateSync = (p: any) => {
+      if (isHost || p?.to !== playerId) return;
+      setScores(p.scores ?? {});
+      setStreaks(p.streaks ?? {});
+      setTotalRounds(p.total ?? TOTAL_ROUNDS);
+      if (p.round) {
+        beginRound(p.round);
+        if (p.answer !== null && p.answer !== undefined) setSelectedAnswerIdx(p.answer);
+      } else {
+        setGameState('COUNTDOWN'); // between rounds: wait for the next round_start
+      }
+    };
+
+    const handlePlayAgain = () => {
+      if (isHost) return;
+      resetRoundState();
+      setGameState('LOBBY');
+    };
+
     const handleGameStart = (p: any) => {
       if (isHost) return;
       setScores({});
@@ -420,7 +519,16 @@ function GameLoop() {
       }
     };
 
+    // Tabs that closed or crashed without a 'leave' show up through presence
+    const handlePresenceLeave = (p: any) => {
+      const id = p?.playerId;
+      if (!id || id === playerId) return;
+      if (id === HOST_ID) handleHostLeft();
+      else handleLeave({ playerId: id });
+    };
+
     const handlers: Record<string, (p: any) => void> = {
+      presence_leave: handlePresenceLeave, state_sync: handleStateSync, play_again: handlePlayAgain,
       join: handleJoin, leave: handleLeave, answer: handleAnswer, time_ping: handleTimePing,
       time_pong: handleTimePong, roster_update: handleRosterUpdate, join_rejected: handleJoinRejected,
       game_start: handleGameStart, round_start: handleRoundStart, round_end: handleRoundEnd,
@@ -484,6 +592,7 @@ function GameLoop() {
       startAt: h.startAt,
       audioUrl: round.song.audioUrl
     };
+    h.lastRound = payload;
     adapterRef.current?.broadcast('round_start', payload);
     beginRound(payload);
     setAnswerProgress({ count: 0, total: playersRef.current.length, answered: [] });
@@ -561,6 +670,7 @@ function GameLoop() {
   useEffect(() => {
     if (gameState !== 'PLAYING' || !currentRound) return;
 
+    if (audioRef.current) audioRef.current.muted = isMuted();
     audioRef.current?.play().catch(e => console.error('[Audio] Playback blocked:', e));
 
     const roundMs = currentRound.seconds * 1000;
@@ -656,7 +766,7 @@ function GameLoop() {
       />
     );
   } else if (gameState === 'END') {
-    content = <EndScreen rows={rankPlayers(players, scores, streaks)} playerId={playerId} onHome={goHome} />;
+    content = <EndScreen rows={rankPlayers(players, scores, streaks)} playerId={playerId} onHome={goHome} onAgain={isHost ? hostPlayAgain : undefined} />;
   } else {
     content = <CountdownScreen count={0} />; // waiting for the first round_start
   }

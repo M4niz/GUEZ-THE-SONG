@@ -17,7 +17,7 @@ Vite 8, React 19, TypeScript (`verbatimModuleSyntax`: use `import type`), `@supa
 
 ## Environment
 
-`.env` (untracked, **not git-ignored**) needs `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` (or `VITE_SUPABASE_PUBLISHABLE_KEY`). If they are missing, `RealtimeAdapter` silently falls back to `BroadcastChannel`, which only works between tabs of the same browser. That is useful for local testing (open two tabs: one hosts, one joins) but a deploy without env vars looks fine and has no real multiplayer.
+`.env` (untracked, git-ignored) needs `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` (or `VITE_SUPABASE_PUBLISHABLE_KEY`). If they are missing, `RealtimeAdapter` silently falls back to `BroadcastChannel`, which only works between tabs of the same browser. That is useful for local testing (open two tabs: one hosts, one joins) but a deploy without env vars looks fine and has no real multiplayer.
 
 ## Architecture
 
@@ -54,9 +54,13 @@ data/songs.json          sample songs; NOT imported anywhere (dead data)
 
 **Live answer info.** `answer_progress` carries `{count,total,answered:[{id,at}],picks?}`. Avatars appear on the timer bar at the moment each player locks in. `picks` (who chose which option) is only included once `REVEAL_PICKS_AT` (75% elapsed, i.e. 25% left) has passed; the host re-broadcasts at that moment via `progressRef`.
 
-**Toasts.** When the host handles a `leave` it shows a bottom-left "[avatar] name left" toast and broadcasts `player_left` so clients show it too.
+**Toasts.** When the host handles a `leave` (explicit, `pagehide`, or Supabase Presence) it shows a bottom-left "[avatar] name left" toast and broadcasts `player_left` so clients show it too. Keep the toast + broadcast inside `handleLeave`: a bad patch once dropped them silently.
 
 **Audio.** One shared `<audio>` element (`audioRef`) is created by `unlockAudio()` inside the Create/Join click and reused for every round (iOS autoplay). `unlockAudio` also resumes the singleton AudioContext used for the sound effects. Keep reusing that element.
+
+**Presence & reconnect.** Every client calls `adapter.track({playerId})` on connect; the adapter turns Supabase presence `leave` events into `presence_leave`, which the host treats as a `leave` (and clients treat as `host_left` when the host's id leaves). That catches closed or crashed tabs. A joiner's `{code, pid, name, avatar}` is kept in `sessionStorage`; on load `GameLoop` rejoins with the same player id. The host recognises a known id (it has a score entry), re-adds it to the roster and sends `state_sync` (scores plus the current `round_start` payload if a round is open, and the player's answer). Between rounds the rejoiner just waits for the next `round_start`. `RealtimeAdapter.cleanup()` closes the channel after 400 ms so a final `leave` can flush. After a refresh the browser may block clip audio until the first tap. Presence does not exist on the `BroadcastChannel` fallback, which relies on `pagehide`.
+
+**Play again / Surprise me / persisted prefs.** The host's End screen can broadcast `play_again`, which sends everyone back to the lobby with the same roster. The lobby's "Surprise me" button starts a game from 3 random `SURPRISE_ARTISTS`. Lobby settings persist in localStorage (`guess-the-song:settings`); mute persists in `guess-the-song:muted` (`utils/audio.ts`, toggled from `TopBar`). A tick sounds in the last 3 seconds of a round.
 
 **Leaving.** `exitGame()` broadcasts `leave` (or `host_left`), tears down the adapter, resets all state and bumps `sessionKey` so `LobbyScreens` remounts at HOME. A joiner that gets no roster reply after 4 join attempts (~10 s) leaves with "Room not found".
 
@@ -69,7 +73,7 @@ data/songs.json          sample songs; NOT imported anywhere (dead data)
 
 ## Plan vs. reality (not implemented)
 
-Presence-based disconnect detection (leaving relies on an explicit `leave` / `pagehide`, so a crashed tab stays in the roster), reconnect with stored player id, movie round type, language/difficulty-aware distractors in manual mode, clip length setting (the round timer is the only length control; previews are 30 s), mascot, mute/vibration toggles, 12-player cap UI feedback beyond a rejection notice, `local` audio source / `songs.json` pipeline. Check this list before assuming a plan feature exists.
+Host reconnect (a refreshed host ends the game), reconnecting into the reveal/leaderboard screens (the rejoiner waits for the next round), background music, movie round type, language/difficulty-aware distractors in manual mode, clip length setting (the round timer is the only length control; previews are 30 s), mascot, vibration toggle, 12-player cap UI feedback beyond a rejection notice, `local` audio source / `songs.json` pipeline. Check this list before assuming a plan feature exists.
 
 ## Security note
 
