@@ -1,9 +1,13 @@
 import { useState, useRef, useEffect } from 'react';
-import { Users, LogIn, Plus, Search, Play, Square, X, Check, Copy, Shuffle, Loader } from 'lucide-react';
+import { Plus, Search, Play, Square, X, Check, Copy, Shuffle, Loader, RotateCcw } from 'lucide-react';
 import { AVATARS } from '../data/avatars';
 import { Avatar } from './Avatar';
-import { LANGUAGES, TOTAL_ROUNDS, buildAutoPlaylist, searchItunes } from '../utils/songs';
-import type { Song } from '../utils/songs';
+import { PixelBackdrop, PixelSprite } from './PixelArt';
+import {
+  CHOICE_OPTIONS, DEFAULT_SETTINGS, LANGUAGES, MAX_ARTISTS, ROUND_OPTIONS, SECONDS_OPTIONS,
+  SURPRISE_ARTISTS, buildAutoPlaylist, searchArtists, searchItunes, shuffle
+} from '../utils/songs';
+import type { ArtistHit, GameSettings, RoundTypes, Song } from '../utils/songs';
 
 interface LobbyScreensProps {
   onHostGame: (avatar: string, name: string) => void;
@@ -11,12 +15,36 @@ interface LobbyScreensProps {
   isHost: boolean;
   roomCode: string | null;
   players: { id: string; name: string; avatar?: string }[];
-  onStartHostGame: (playlist: Song[], pool: Song[]) => void;
+  onStartHostGame: (playlist: Song[], pool: Song[], settings: GameSettings) => void;
   notice: string | null;
   onDismissNotice: () => void;
 }
 
+const SETTINGS_KEY = 'guess-the-song:settings';
+
+/** Last-used settings, validated against the allowed options */
+function loadSettings(): GameSettings {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? 'null');
+    if (raw
+      && ROUND_OPTIONS.includes(raw.rounds)
+      && SECONDS_OPTIONS.includes(raw.roundSeconds)
+      && CHOICE_OPTIONS.includes(raw.choices)
+      && ['mixed', 'title', 'artist'].includes(raw.roundTypes)) {
+      return raw as GameSettings;
+    }
+  } catch { /* fall through to defaults */ }
+  return DEFAULT_SETTINGS;
+}
+
 type SetupMode = 'pick' | 'auto';
+type SetupTab = SetupMode | 'settings';
+
+const ROUND_TYPE_OPTIONS: { id: RoundTypes; label: string }[] = [
+  { id: 'mixed', label: 'Mixed' },
+  { id: 'title', label: 'Song only' },
+  { id: 'artist', label: 'Artist only' }
+];
 
 function SongRow({ song, children }: { song: Song; children: React.ReactNode }) {
   return (
@@ -42,7 +70,7 @@ export function LobbyScreens({
   onDismissNotice
 }: LobbyScreensProps) {
 
-  const [view, setView] = useState<'HOME' | 'JOIN' | 'LOBBY'>('HOME');
+  const [view, setView] = useState<'HOME' | 'JOIN' | 'LOBBY'>(roomCode ? 'LOBBY' : 'HOME'); // roomCode is set when resuming or playing again
   const [joinCode, setJoinCode] = useState('');
   const [joinName, setJoinName] = useState('');
   const [selectedAvatar, setSelectedAvatar] = useState('cat');
@@ -50,7 +78,9 @@ export function LobbyScreens({
   const [copied, setCopied] = useState(false);
 
   // Host setup
-  const [mode, setMode] = useState<SetupMode>('pick');
+  const [tab, setTab] = useState<SetupTab>('pick');
+  const [mode, setMode] = useState<SetupMode>('pick'); // which song source Start uses
+  const [settings, setSettings] = useState<GameSettings>(loadSettings);
   const [searchTerm, setSearchTerm] = useState('');
   const [searchResults, setSearchResults] = useState<Song[]>([]);
   const [isSearching, setIsSearching] = useState(false);
@@ -60,7 +90,13 @@ export function LobbyScreens({
   const [playingPreview, setPlayingPreview] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  const [autoArtist, setAutoArtist] = useState('');
+  const [artistQuery, setArtistQuery] = useState('');
+  const [artistHits, setArtistHits] = useState<ArtistHit[]>([]);
+  const [artistLoading, setArtistLoading] = useState(false);
+  const [artistError, setArtistError] = useState(false);
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [artists, setArtists] = useState<ArtistHit[]>([]);
+  const dropdownRef = useRef<HTMLDivElement | null>(null);
   const [autoLang, setAutoLang] = useState('any');
   const [autoLoading, setAutoLoading] = useState(false);
   const [autoError, setAutoError] = useState<string | null>(null);
@@ -72,6 +108,59 @@ export function LobbyScreens({
       }
     };
   }, []);
+
+  useEffect(() => {
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch { /* storage unavailable */ }
+  }, [settings]);
+
+  // Search artists as the host types (debounced; late responses are ignored)
+  useEffect(() => {
+    const q = artistQuery.trim();
+    if (q.length < 2) return;
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      setArtistLoading(true);
+      setArtistError(false);
+      try {
+        const hits = await searchArtists(q);
+        if (!cancelled) setArtistHits(hits);
+      } catch {
+        if (!cancelled) { setArtistHits([]); setArtistError(true); }
+      }
+      if (!cancelled) setArtistLoading(false);
+    }, 350);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [artistQuery]);
+
+  useEffect(() => {
+    const close = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) setDropdownOpen(false);
+    };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, []);
+
+  const onArtistInput = (value: string) => {
+    setArtistQuery(value);
+    setDropdownOpen(true);
+    if (value.trim().length < 2) { setArtistHits([]); setArtistLoading(false); setArtistError(false); }
+  };
+
+  const addArtist = (hit: ArtistHit) => {
+    if (artists.length >= MAX_ARTISTS || artists.some(a => a.id === hit.id)) return;
+    setArtists([...artists, hit]);
+    setArtistQuery('');
+    setArtistHits([]);
+    setDropdownOpen(false);
+  };
+
+  const removeArtist = (id: string) => setArtists(artists.filter(a => a.id !== id));
+
+  const updateSettings = (patch: Partial<GameSettings>) => {
+    const next = { ...settings, ...patch };
+    setSettings(next);
+    if (playlist.length > next.rounds) setPlaylist(playlist.slice(0, next.rounds)); // keep the playlist within the new round count
+  };
 
   const stopPreview = () => {
     audioRef.current?.pause();
@@ -110,7 +199,7 @@ export function LobbyScreens({
   const inPlaylist = (id: string) => playlist.some(s => s.id === id);
 
   const addToPlaylist = (song: Song) => {
-    if (playlist.length >= TOTAL_ROUNDS || inPlaylist(song.id)) return;
+    if (playlist.length >= settings.rounds || inPlaylist(song.id)) return;
     setPlaylist([...playlist, song]);
   };
 
@@ -119,17 +208,33 @@ export function LobbyScreens({
   const handleStart = async () => {
     stopPreview();
     if (mode === 'pick') {
-      onStartHostGame(playlist, playlist);
+      onStartHostGame(playlist, playlist, settings);
       return;
     }
     setAutoLoading(true);
     setAutoError(null);
     try {
-      const { playlist: picked, pool, note } = await buildAutoPlaylist(autoArtist, autoLang);
+      const { playlist: picked, pool, note } = await buildAutoPlaylist(artists.map(a => a.name), autoLang, settings.rounds);
       if (note) console.info('[Auto playlist]', note);
-      onStartHostGame(picked, pool);
+      onStartHostGame(picked, pool, settings);
     } catch (err) {
       setAutoError(err instanceof Error ? err.message : 'Something went wrong. Try again.');
+    }
+    setAutoLoading(false);
+  };
+
+  const handleSurprise = async () => {
+    stopPreview();
+    setAutoLoading(true);
+    setAutoError(null);
+    try {
+      const picks = shuffle(SURPRISE_ARTISTS).slice(0, 3);
+      const { playlist: picked, pool } = await buildAutoPlaylist(picks, 'any', settings.rounds);
+      onStartHostGame(picked, pool, settings);
+    } catch (err) {
+      setAutoError(err instanceof Error ? err.message : 'Something went wrong. Try again.');
+      setTab('auto');
+      setMode('auto');
     }
     setAutoLoading(false);
   };
@@ -166,9 +271,11 @@ export function LobbyScreens({
 
   if (view === 'HOME') {
     return (
-      <div className="page page-center">
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: '96px', height: '96px', backgroundColor: 'var(--green)', borderRadius: '32px', color: 'white', borderBottom: '6px solid var(--green-dark)' }}>
-          <Users size={56} />
+      <>
+      <PixelBackdrop />
+      <div className="page page-center" style={{ position: 'relative', zIndex: 1 }}>
+        <div className="logo-box">
+          <PixelSprite name="cd" size={80} className="px-spin" />
         </div>
         <h1 className="text-h1" style={{ color: 'var(--green-text)' }}>Guess the Song</h1>
 
@@ -181,19 +288,22 @@ export function LobbyScreens({
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', width: '100%', maxWidth: '320px' }}>
           <button className="btn" onClick={handleHostClick}>
-            <Plus size={20} /> Create room
+            Create room
           </button>
           <button className="btn blue" onClick={() => { setIsHostForm(false); setView('JOIN'); }}>
-            <LogIn size={20} /> Join room
+            Join room
           </button>
         </div>
       </div>
+      </>
     );
   }
 
   if (view === 'JOIN') {
     return (
-      <div className="page page-center">
+      <>
+      <PixelBackdrop />
+      <div className="page page-center" style={{ position: 'relative', zIndex: 1 }}>
         <h1 className="text-h1" style={{ color: 'var(--blue-text)' }}>
           {isHostForm ? 'Create Room' : 'Join Room'}
         </h1>
@@ -258,14 +368,14 @@ export function LobbyScreens({
           </button>
         </form>
       </div>
+      </>
     );
   }
 
   // ---------------- LOBBY ----------------
-  const needMorePlayers = players.length < 2;
   const startDisabled =
-    needMorePlayers || autoLoading ||
-    (mode === 'pick' ? playlist.length !== TOTAL_ROUNDS : !autoArtist.trim() && autoLang === 'any');
+    autoLoading ||
+    (mode === 'pick' ? playlist.length !== settings.rounds : artists.length === 0 && autoLang === 'any');
 
   return (
     <div className="page" style={{ gap: '16px' }}>
@@ -307,11 +417,12 @@ export function LobbyScreens({
         <>
           <div className="card">
             <div className="seg" role="tablist">
-              <button role="tab" aria-selected={mode === 'pick'} className={mode === 'pick' ? 'active' : ''} onClick={() => setMode('pick')}>Pick songs</button>
-              <button role="tab" aria-selected={mode === 'auto'} className={mode === 'auto' ? 'active' : ''} onClick={() => { stopPreview(); setMode('auto'); }}>Artist / Language</button>
+              <button role="tab" aria-selected={tab === 'pick'} className={tab === 'pick' ? 'active' : ''} onClick={() => { setTab('pick'); setMode('pick'); }}>Pick songs</button>
+              <button role="tab" aria-selected={tab === 'auto'} className={tab === 'auto' ? 'active' : ''} onClick={() => { stopPreview(); setTab('auto'); setMode('auto'); }}>Artists</button>
+              <button role="tab" aria-selected={tab === 'settings'} className={tab === 'settings' ? 'active' : ''} onClick={() => { stopPreview(); setTab('settings'); }}>Settings</button>
             </div>
 
-            {mode === 'pick' ? (
+            {tab === 'pick' ? (
               <>
                 <form onSubmit={handleSearch} style={{ display: 'flex', gap: '8px', marginBottom: '14px' }}>
                   <input
@@ -336,7 +447,7 @@ export function LobbyScreens({
                       <button className="icon-btn sm blue" aria-label="Preview" onClick={() => togglePreview(song.audioUrl)}>
                         {playingPreview === song.audioUrl ? <Square size={14} fill="currentColor" /> : <Play size={14} fill="currentColor" />}
                       </button>
-                      <button className="icon-btn sm green" aria-label="Add to playlist" disabled={inPlaylist(song.id) || playlist.length >= TOTAL_ROUNDS} onClick={() => addToPlaylist(song)}>
+                      <button className="icon-btn sm green" aria-label="Add to playlist" disabled={inPlaylist(song.id) || playlist.length >= settings.rounds} onClick={() => addToPlaylist(song)}>
                         {inPlaylist(song.id) ? <Check size={16} strokeWidth={3} /> : <Plus size={16} strokeWidth={3} />}
                       </button>
                     </SongRow>
@@ -345,12 +456,12 @@ export function LobbyScreens({
 
                 <div className="card-title" style={{ marginBottom: '10px' }}>
                   <span>Playlist</span>
-                  <span style={{ color: playlist.length === TOTAL_ROUNDS ? 'var(--green-text)' : 'var(--orange)' }}>
-                    {playlist.length} / {TOTAL_ROUNDS}
+                  <span style={{ color: playlist.length === settings.rounds ? 'var(--green-text)' : 'var(--orange)' }}>
+                    {playlist.length} / {settings.rounds}
                   </span>
                 </div>
                 <div className="song-list">
-                  {playlist.length === 0 && <div className="empty-note">Add {TOTAL_ROUNDS} songs to start</div>}
+                  {playlist.length === 0 && <div className="empty-note">Add {settings.rounds} songs to start</div>}
                   {playlist.map(song => (
                     <SongRow key={song.id} song={song}>
                       <button className="icon-btn sm red" aria-label="Remove" onClick={() => removeFromPlaylist(song.id)}>
@@ -360,17 +471,57 @@ export function LobbyScreens({
                   ))}
                 </div>
               </>
-            ) : (
+            ) : tab === 'auto' ? (
               <>
-                <div className="field-label">Artist</div>
-                <input
-                  className="input"
-                  type="text"
-                  placeholder="e.g. Anirudh Ravichander"
-                  value={autoArtist}
-                  onChange={e => setAutoArtist(e.target.value)}
-                  style={{ marginBottom: '20px' }}
-                />
+                <div className="field-label">Artists ({artists.length}/{MAX_ARTISTS})</div>
+                {artists.length > 0 && (
+                  <div className="chips" style={{ marginBottom: '12px' }}>
+                    {artists.map(a => (
+                      <button key={a.id} type="button" className="chip active" onClick={() => removeArtist(a.id)} aria-label={`Remove ${a.name}`} style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
+                        {a.name} <X size={14} strokeWidth={3} />
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <div ref={dropdownRef} style={{ position: 'relative', marginBottom: '20px' }}>
+                  <input
+                    className="input"
+                    type="text"
+                    role="combobox"
+                    aria-expanded={dropdownOpen}
+                    autoComplete="off"
+                    placeholder={artists.length ? 'Add another artist…' : 'Type an artist, e.g. Anirudh'}
+                    value={artistQuery}
+                    disabled={artists.length >= MAX_ARTISTS}
+                    onChange={e => onArtistInput(e.target.value)}
+                    onFocus={() => setDropdownOpen(true)}
+                    onKeyDown={e => {
+                      if (e.key === 'Escape') setDropdownOpen(false);
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        const first = artistHits.find(h => !artists.some(a => a.id === h.id));
+                        if (first) addArtist(first);
+                      }
+                    }}
+                  />
+                  {dropdownOpen && artistQuery.trim().length >= 2 && (
+                    <div className="dropdown" role="listbox">
+                      {artistLoading && <div className="dropdown-note"><Loader size={14} /> Searching…</div>}
+                      {artistError && <div className="dropdown-note" style={{ color: 'var(--red-text)' }}>Search failed. Try again.</div>}
+                      {!artistLoading && !artistError && artistHits.length === 0 && <div className="dropdown-note">No artists found</div>}
+                      {artistHits.map(hit => {
+                        const picked = artists.some(a => a.id === hit.id);
+                        return (
+                          <button key={hit.id} type="button" role="option" aria-selected={picked} className="dropdown-item" disabled={picked} onClick={() => addArtist(hit)}>
+                            <span className="name">{hit.name}</span>
+                            <span className="genre">{picked ? 'Added' : hit.genre}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
                 <div className="field-label">Language</div>
                 <div className="chips">
                   {LANGUAGES.map(l => (
@@ -381,20 +532,62 @@ export function LobbyScreens({
                 </div>
                 <div className="hint-note">
                   <Shuffle size={13} style={{ verticalAlign: '-2px', marginRight: '6px' }} />
-                  Choose an artist, a language, or both. We pull matching songs from iTunes, shuffle them, and pick {TOTAL_ROUNDS} for the game.
+                  Add one or more artists, pick a language, or both. We pull their songs from iTunes, shuffle them, and pick {settings.rounds} for the game.
                   Language is matched by iTunes genre, so it can miss some songs.
                 </div>
                 {autoError && <div className="error-note">{autoError}</div>}
+              </>
+            ) : (
+              <>
+                <div className="field-label">Seconds per round</div>
+                <div className="chips" style={{ marginBottom: '20px' }}>
+                  {SECONDS_OPTIONS.map(n => (
+                    <button key={n} type="button" className={`chip ${settings.roundSeconds === n ? 'active' : ''}`} onClick={() => updateSettings({ roundSeconds: n })}>{n}s</button>
+                  ))}
+                </div>
+
+                <div className="field-label">Answer choices</div>
+                <div className="chips" style={{ marginBottom: '20px' }}>
+                  {CHOICE_OPTIONS.map(n => (
+                    <button key={n} type="button" className={`chip ${settings.choices === n ? 'active' : ''}`} onClick={() => updateSettings({ choices: n })}>{n}</button>
+                  ))}
+                </div>
+
+                <div className="field-label">Number of rounds</div>
+                <div className="chips" style={{ marginBottom: '20px' }}>
+                  {ROUND_OPTIONS.map(n => (
+                    <button key={n} type="button" className={`chip ${settings.rounds === n ? 'active' : ''}`} onClick={() => updateSettings({ rounds: n })}>{n}</button>
+                  ))}
+                </div>
+
+                <div className="field-label">Question type</div>
+                <div className="chips">
+                  {ROUND_TYPE_OPTIONS.map(t => (
+                    <button key={t.id} type="button" className={`chip ${settings.roundTypes === t.id ? 'active' : ''}`} onClick={() => updateSettings({ roundTypes: t.id })}>{t.label}</button>
+                  ))}
+                </div>
+
+                <div className="hint-note">
+                  {settings.rounds} rounds · {settings.roundSeconds}s each · {settings.choices} choices.
+                  {mode === 'pick' && settings.choices > settings.rounds && ` Pick mode draws wrong answers from your ${settings.rounds} songs, so some questions may show fewer than ${settings.choices} choices.`}
+                  {settings.roundTypes === 'artist' && " Artist-only needs several different artists; rounds fall back to song questions when it can't find enough."}
+                </div>
+                <button type="button" className="btn gray" style={{ marginTop: '16px', width: '100%' }} onClick={() => updateSettings(DEFAULT_SETTINGS)}>
+                  <RotateCcw size={16} /> Reset to defaults
+                </button>
               </>
             )}
           </div>
 
           <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '10px', paddingTop: '8px' }}>
-            {needMorePlayers && (
-              <div className="hint-note" style={{ textAlign: 'center', margin: 0 }}>Waiting for at least one player to join…</div>
+            {players.length < 2 && (
+              <div className="hint-note" style={{ textAlign: 'center', margin: 0 }}>Playing solo? Start any time, or wait for friends to join.</div>
             )}
             <button className="btn" onClick={handleStart} disabled={startDisabled} style={{ width: '100%' }}>
               {autoLoading ? 'Finding songs…' : mode === 'auto' ? 'Shuffle & start' : 'Start game'}
+            </button>
+            <button className="btn gray" onClick={handleSurprise} disabled={autoLoading} style={{ width: '100%' }}>
+              <Shuffle size={18} /> Surprise me
             </button>
           </div>
         </>

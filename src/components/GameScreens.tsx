@@ -3,7 +3,7 @@ import { Check, Flame, Music, Trophy, X, Zap } from 'lucide-react';
 import { Avatar } from './Avatar';
 import { Confetti, StreakBadge, XpBadge } from './Effects';
 import type { Row } from '../utils/ranking';
-import { playCoinTone, playCorrectTone, playWrongTone, vibrate } from '../utils/audio';
+import { playCoinTone, playCorrectTone, playTickTone, playWrongTone, vibrate } from '../utils/audio';
 
 export interface Player {
   id: string;
@@ -15,6 +15,22 @@ export interface RoundInfo {
   roundNo: number;
   options: string[];
   type: 'title' | 'artist';
+}
+
+export interface AnswerInfo {
+  count: number;
+  total: number;
+  /** Who has locked in, and how many ms into the round they did */
+  answered: { id: string; at: number }[];
+  /** playerId -> option index; only present once the last quarter of the timer starts */
+  picks?: Record<string, number>;
+}
+
+export interface RoundDetail {
+  base: number;
+  speed: number;
+  streak: number;
+  tMs: number;
 }
 
 export interface RevealSong {
@@ -47,34 +63,74 @@ export function CountdownScreen({ count }: { count: number }) {
 
 // ---------------- Playing ----------------
 
+/** Avatars that sit on the timer bar at the moment each player locked in an answer */
+function AnswerMarkers({ answered, players, roundMs }: { answered: AnswerInfo['answered']; players: Player[]; roundMs: number }) {
+  const placed: number[] = [];
+  return (
+    <div className="timer-markers">
+      {[...answered].sort((a, b) => a.at - b.at).map(a => {
+        const pos = Math.min(1, Math.max(0, 1 - a.at / roundMs)); // the bar drains right to left
+        const level = placed.filter(p => Math.abs(p - pos) < 0.08).length;
+        placed.push(pos);
+        const player = players.find(p => p.id === a.id);
+        return (
+          <div key={a.id} className="timer-marker" style={{ left: `${pos * 100}%`, bottom: level * 32 }}>
+            <Avatar id={player?.avatar} size={28} />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 interface PlayingProps {
   round: RoundInfo;
+  roundSeconds: number;
   total: number;
   timeLeft: number;
   /** 0..1 fraction of the round remaining */
   timeFrac: number;
   selected: number | null;
-  isHost: boolean;
+  playerId: string;
+  players: Player[];
   score: number;
   streak: number;
-  answered: { count: number; total: number } | null;
+  answerInfo: AnswerInfo | null;
   onAnswer: (idx: number) => void;
 }
 
-export function PlayingScreen({ round, total, timeLeft, timeFrac, selected, isHost, score, streak, answered, onAnswer }: PlayingProps) {
-  const timerColor = timeLeft <= 5 ? 'var(--red)' : timeLeft <= 8 ? 'var(--yellow)' : 'var(--green)';
-  const locked = selected !== null || isHost;
+export function PlayingScreen({ round, roundSeconds, total, timeLeft, timeFrac, selected, playerId, players, score, streak, answerInfo, onAnswer }: PlayingProps) {
+  const timerColor = timeFrac <= 0.33 ? 'var(--red)' : timeFrac <= 0.55 ? 'var(--yellow)' : 'var(--green)';
+  const locked = selected !== null;
+  const picks = answerInfo?.picks;
+
+  // Tick during the last three seconds
+  useEffect(() => {
+    if (timeLeft > 0 && timeLeft <= 3) playTickTone();
+  }, [timeLeft]);
+
+  // Other players' picks only appear once ~25% of the timer is left
+  const pickersFor = (idx: number) =>
+    picks
+      ? Object.entries(picks)
+          .filter(([id, choice]) => choice === idx && id !== playerId)
+          .map(([id]) => players.find(p => p.id === id))
+          .filter((p): p is Player => !!p)
+      : [];
 
   return (
     <div className="page">
       <ProgressHeader roundNo={round.roundNo} total={total}>
-        {!isHost && <StreakBadge streak={streak} />}
-        {!isHost && <XpBadge total={score} />}
+        <StreakBadge streak={streak} />
+        <XpBadge total={score} />
       </ProgressHeader>
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px' }}>
-        <div className="progress" style={{ height: '12px' }}>
-          <div style={{ width: `${timeFrac * 100}%`, backgroundColor: timerColor, transition: 'width 0.1s linear, background-color 0.3s' }} />
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px', margin: '44px 0 24px' }}>
+        <div className="timer-wrap">
+          {answerInfo && <AnswerMarkers answered={answerInfo.answered} players={players} roundMs={roundSeconds * 1000} />}
+          <div className="progress" style={{ height: '12px' }}>
+            <div style={{ width: `${timeFrac * 100}%`, backgroundColor: timerColor, transition: 'width 0.1s linear, background-color 0.3s' }} />
+          </div>
         </div>
         <div style={{ width: '28px', textAlign: 'right', fontWeight: 900, color: timerColor }}>{timeLeft}</div>
       </div>
@@ -86,26 +142,33 @@ export function PlayingScreen({ round, total, timeLeft, timeFrac, selected, isHo
           Guess the {round.type === 'title' ? 'song' : 'artist'}!
         </h2>
         <div className="text-body" style={{ color: 'var(--text-muted)', minHeight: '24px', textAlign: 'center' }}>
-          {isHost
-            ? `You're hosting · ${answered?.count ?? 0}/${answered?.total ?? 0} answered`
-            : selected !== null
-              ? `Locked in! Waiting for others${answered ? ` (${answered.count}/${answered.total})` : '…'}`
-              : ''}
+          {locked
+            ? `Locked in! Waiting for others${answerInfo ? ` (${answerInfo.count}/${answerInfo.total})` : '…'}`
+            : picks ? 'Everyone’s picks are showing!' : ''}
         </div>
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-        {round.options.map((opt, i) => (
-          <button
-            key={i}
-            className={`answer-card ${selected === i ? 'selected' : ''} ${selected !== null && selected !== i ? 'dim' : ''}`}
-            onClick={() => onAnswer(i)}
-            disabled={locked}
-          >
-            <span className="key">{i + 1}</span>
-            <span style={{ flex: 1 }}>{opt}</span>
-          </button>
-        ))}
+        {round.options.map((opt, i) => {
+          const pickers = pickersFor(i);
+          return (
+            <button
+              key={i}
+              className={`answer-card ${selected === i ? 'selected' : ''} ${selected !== null && selected !== i ? 'dim' : ''}`}
+              onClick={() => onAnswer(i)}
+              disabled={locked}
+            >
+              <span className="key">{i + 1}</span>
+              <span style={{ flex: 1 }}>{opt}</span>
+              {pickers.length > 0 && (
+                <span className="pickers">
+                  {pickers.slice(0, 5).map(p => <Avatar key={p.id} id={p.avatar} size={26} />)}
+                  {pickers.length > 5 && <span className="more">+{pickers.length - 5}</span>}
+                </span>
+              )}
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -123,19 +186,18 @@ interface RevealProps {
   song: RevealSong | null;
   score: number;
   earned: number;
+  detail?: RoundDetail;
   streak: number;
   correctPlayers: Player[];
-  respondents: number;
   onContinue: () => void;
 }
 
-export function RevealScreen({ roundNo, total, isHost, selected, correctIndex, options, song, score, earned, streak, correctPlayers, respondents, onContinue }: RevealProps) {
+export function RevealScreen({ roundNo, total, isHost, selected, correctIndex, options, song, score, earned, detail, streak, correctPlayers, onContinue }: RevealProps) {
   const answered = selected !== null;
-  const isCorrect = !isHost && selected === correctIndex;
-  const tone: 'correct' | 'wrong' | 'neutral' = isHost ? 'neutral' : isCorrect ? 'correct' : 'wrong';
+  const isCorrect = selected === correctIndex;
+  const tone: 'correct' | 'wrong' = isCorrect ? 'correct' : 'wrong';
 
   useEffect(() => {
-    if (isHost) return;
     if (isCorrect) {
       playCorrectTone();
       const t = window.setTimeout(() => playCoinTone(Math.min(5, Math.max(3, Math.round(earned / 250)))), 700);
@@ -145,7 +207,7 @@ export function RevealScreen({ roundNo, total, isHost, selected, correctIndex, o
       playWrongTone();
       vibrate([120, 60, 120]);
     }
-  }, [isHost, isCorrect, answered, earned]);
+  }, [isCorrect, answered, earned]);
 
   const answerText = options[correctIndex];
 
@@ -155,8 +217,8 @@ export function RevealScreen({ roundNo, total, isHost, selected, correctIndex, o
       {tone === 'wrong' && <div className="screen-flash wrong" />}
 
       <ProgressHeader roundNo={roundNo + 1} total={total}>
-        {!isHost && <StreakBadge streak={streak} grow={isCorrect && streak >= 3} />}
-        {!isHost && <XpBadge total={score} earned={earned} delay={500} />}
+        <StreakBadge streak={streak} grow={isCorrect && streak >= 3} />
+        <XpBadge total={score} earned={earned} delay={500} />
       </ProgressHeader>
 
       {/* The answer sits in the middle of the screen */}
@@ -187,27 +249,34 @@ export function RevealScreen({ roundNo, total, isHost, selected, correctIndex, o
           <div style={{
             width: '48px', height: '48px', borderRadius: '50%', flex: 'none', color: 'white',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
-            backgroundColor: tone === 'correct' ? 'var(--green)' : tone === 'wrong' ? 'var(--red)' : 'var(--blue)',
+            backgroundColor: isCorrect ? 'var(--green)' : 'var(--red)',
             animation: 'pop 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) 0.2s both'
           }}>
-            {tone === 'correct' ? <Check size={30} strokeWidth={4} /> : tone === 'wrong' ? <X size={30} strokeWidth={4} /> : <Trophy size={26} />}
+            {isCorrect ? <Check size={30} strokeWidth={4} /> : <X size={30} strokeWidth={4} />}
           </div>
           <div style={{ flex: 1, minWidth: 0 }}>
-            <h2 className="text-h2" style={{ fontSize: '24px', color: tone === 'correct' ? 'var(--green-text)' : tone === 'wrong' ? 'var(--red-text)' : 'var(--text-dark)' }}>
-              {isHost ? 'Round results' : isCorrect ? 'Excellent!' : answered ? 'Not quite' : "Time's up!"}
+            <h2 className="text-h2" style={{ fontSize: '24px', color: isCorrect ? 'var(--green-text)' : 'var(--red-text)' }}>
+              {isCorrect ? 'Excellent!' : answered ? 'Not quite' : "Time's up!"}
             </h2>
             <div style={{ fontWeight: 700, color: 'var(--text-muted)' }}>
-              {isHost
-                ? `${correctPlayers.length} of ${respondents} got it right`
+              {isCorrect && detail
+                ? `Answered in ${(detail.tMs / 1000).toFixed(1)}s. Faster answers score more.`
                 : isCorrect ? 'Nice one, you nailed it' : 'Better luck on the next song'}
             </div>
           </div>
         </div>
 
-        {!isHost && (earned > 0 || streak >= 2) && (
+        {(earned > 0 || streak >= 2) && (
           <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
             {earned > 0 && <span className="earned-pill"><Zap size={18} fill="currentColor" /> +{earned} XP</span>}
             {streak >= 2 && <span className="streak-pill"><Flame size={18} fill="currentColor" /> {streak} in a row</span>}
+          </div>
+        )}
+        {detail && earned > 0 && (
+          <div className="breakdown">
+            <span>Base {detail.base}</span>
+            <span className="speed">Speed +{detail.speed}</span>
+            {detail.streak > 0 && <span className="streakb">Streak +{detail.streak}</span>}
           </div>
         )}
 
@@ -278,7 +347,7 @@ const PODIUM = [
   { place: 3, height: 95, color: 'var(--orange)' }
 ];
 
-export function EndScreen({ rows, playerId, onHome }: { rows: Row[]; playerId: string; onHome: () => void }) {
+export function EndScreen({ rows, playerId, onHome, onAgain }: { rows: Row[]; playerId: string; onHome: () => void; onAgain?: () => void }) {
   // visual order: 2nd, 1st, 3rd
   const slots = [rows[1], rows[0], rows[2]].map((row, i) => ({ row, ...PODIUM[[1, 0, 2][i]] }));
   const iWon = rows[0]?.id === playerId;
@@ -306,7 +375,8 @@ export function EndScreen({ rows, playerId, onHome }: { rows: Row[]; playerId: s
         </div>
       )}
 
-      <button className="btn" onClick={onHome} style={{ width: '100%', maxWidth: '400px' }}>Back to home</button>
+      {onAgain && <button className="btn" onClick={onAgain} style={{ width: '100%', maxWidth: '400px' }}>Play again</button>}
+      <button className={onAgain ? 'btn gray' : 'btn'} onClick={onHome} style={{ width: '100%', maxWidth: '400px' }}>Back to home</button>
     </div>
   );
 }

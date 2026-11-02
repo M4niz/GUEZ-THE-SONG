@@ -19,13 +19,40 @@ export interface HostRound {
   correctIndex: number;
 }
 
+export type RoundTypes = 'mixed' | 'title' | 'artist';
+
+export interface GameSettings {
+  rounds: number;
+  roundSeconds: number;
+  /** Answer options per question, including the correct one */
+  choices: number;
+  roundTypes: RoundTypes;
+}
+
 export const TOTAL_ROUNDS = 5;
 export const ROUND_SECONDS = 15;
-export const ROUND_MS = ROUND_SECONDS * 1000;
+export const DEFAULT_SETTINGS: GameSettings = { rounds: TOTAL_ROUNDS, roundSeconds: ROUND_SECONDS, choices: 4, roundTypes: 'mixed' };
+
+export const ROUND_OPTIONS = [3, 5, 8, 10, 15];
+export const SECONDS_OPTIONS = [10, 15, 20, 30]; // previews are 30 s long
+export const CHOICE_OPTIONS = [2, 3, 4, 5, 6];
+export const MAX_ARTISTS = 5;
+/** Pool for the "Surprise me" button */
+export const SURPRISE_ARTISTS = [
+  'A.R. Rahman', 'Anirudh Ravichander', 'Arijit Singh', 'Sid Sriram', 'Shreya Ghoshal', 'Yuvan Shankar Raja',
+  'Harris Jayaraj', 'Sonu Nigam', 'Badshah', 'Ed Sheeran', 'Taylor Swift', 'Coldplay'
+];
 export const COUNTDOWN_MS = 3000;
 /** How long the host keeps accepting answers after the timer hits zero (network latency) */
 export const ANSWER_GRACE_MS = 1200;
 export const MAX_PLAYERS = 12;
+/** Scoring: a flat base, a speed share that shrinks as the timer runs down, and a capped streak bonus */
+export const SCORE_BASE = 300;
+export const SCORE_SPEED = 700;
+export const STREAK_STEP = 50;
+export const STREAK_CAP = 250;
+/** Other players' picks become visible when this fraction of the round has elapsed (25% left) */
+export const REVEAL_PICKS_AT = 0.75;
 
 export function shuffle<T>(items: T[]): T[] {
   const a = [...items];
@@ -48,9 +75,10 @@ const primaryArtist = (a: string) =>
 /**
  * Build one question per song. Distractors come from `pool` (a bigger set than the playlist when
  * available) and never duplicate the correct answer or each other. If a round type can't produce
- * 3 distinct distractors (e.g. every song is by the same artist) it falls back to the other type.
+ * enough distinct distractors (e.g. every song is by the same artist) it falls back to the other type.
  */
-export function buildRounds(songs: Song[], pool: Song[]): HostRound[] {
+export function buildRounds(songs: Song[], pool: Song[], settings: Pick<GameSettings, 'choices' | 'roundTypes'> = DEFAULT_SETTINGS): HostRound[] {
+  const wanted = Math.max(1, settings.choices - 1);
   const everyone = [...songs, ...pool.filter(p => !songs.some(s => s.id === p.id))];
 
   const attempt = (song: Song, type: RoundType) => {
@@ -63,15 +91,15 @@ export function buildRounds(songs: Song[], pool: Song[]): HostRound[] {
       if (!k || seen.has(k)) continue;
       seen.add(k);
       distractors.push(text(s));
-      if (distractors.length === 3) break;
+      if (distractors.length === wanted) break;
     }
     return { type, correct: text(song), distractors };
   };
 
   return songs.map(song => {
-    const first: RoundType = Math.random() < 0.5 ? 'title' : 'artist';
+    const first: RoundType = settings.roundTypes === 'mixed' ? (Math.random() < 0.5 ? 'title' : 'artist') : settings.roundTypes;
     let pick = attempt(song, first);
-    if (pick.distractors.length < 3) {
+    if (pick.distractors.length < wanted) {
       const alt = attempt(song, first === 'title' ? 'artist' : 'title');
       if (alt.distractors.length > pick.distractors.length) pick = alt;
     }
@@ -100,6 +128,24 @@ export async function searchItunes(term: string, limit = 10): Promise<Song[]> {
     }));
 }
 
+export interface ArtistHit {
+  id: string;
+  name: string;
+  genre: string;
+}
+
+export async function searchArtists(term: string, limit = 8): Promise<ArtistHit[]> {
+  const response = await fetchJsonp(
+    `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&country=IN&entity=musicArtist&limit=${limit}`
+  );
+  const data = await response.json();
+  const seen = new Set<string>();
+  return (data.results as any[])
+    .filter(r => r.artistId && r.artistName)
+    .map(r => ({ id: String(r.artistId), name: r.artistName as string, genre: (r.primaryGenreName as string) || '' }))
+    .filter(a => !seen.has(a.name.toLowerCase()) && !!seen.add(a.name.toLowerCase()));
+}
+
 export interface Language {
   id: string;
   label: string;
@@ -126,17 +172,18 @@ export interface AutoPlaylist {
   note?: string;
 }
 
-/**
- * "Pick an artist and/or a language" mode: pull a pool from iTunes, clean it up, shuffle,
- * and take TOTAL_ROUNDS songs. The whole pool is kept for distractors.
- */
-export async function buildAutoPlaylist(artist: string, languageId: string): Promise<AutoPlaylist> {
-  const a = artist.trim();
-  const lang = LANGUAGES.find(l => l.id === languageId) ?? LANGUAGES[0];
-  if (!a && lang.id === 'any') throw new Error('Enter an artist or choose a language.');
+const squash = (t: string) => t.toLowerCase().replace(/[^a-z0-9]/g, '');
 
-  const terms = a
-    ? lang.id === 'any' ? [a] : [a, `${a} ${lang.label}`]
+/**
+ * "Pick artists and/or a language" mode: pull a pool from iTunes, clean it up, shuffle,
+ * and take `rounds` songs. The whole pool is kept for distractors.
+ */
+export async function buildAutoPlaylist(artists: string[], languageId: string, rounds: number): Promise<AutoPlaylist> {
+  const lang = LANGUAGES.find(l => l.id === languageId) ?? LANGUAGES[0];
+  if (artists.length === 0 && lang.id === 'any') throw new Error('Add an artist or choose a language.');
+
+  const terms = artists.length
+    ? artists
     : [`${lang.label} songs`, `${lang.label} hits`, `best of ${lang.label}`];
 
   const batches = await Promise.allSettled(terms.map(t => searchItunes(t, 50)));
@@ -146,21 +193,19 @@ export async function buildAutoPlaylist(artist: string, languageId: string): Pro
   let note: string | undefined;
   let candidates = fetched.filter(s => !JUNK.test(s.title) && !JUNK.test(s.movie));
 
-  if (a) {
-    const needle = a.toLowerCase().replace(/[^a-z0-9]/g, '');
-    const byArtist = candidates.filter(s => s.artist.toLowerCase().replace(/[^a-z0-9]/g, '').includes(needle));
-    if (byArtist.length < TOTAL_ROUNDS) throw new Error(`Not enough playable songs found for "${a}".`);
-    candidates = byArtist;
+  if (artists.length) {
+    const needles = artists.map(squash);
+    candidates = candidates.filter(s => needles.some(n => squash(s.artist).includes(n)));
   }
 
   if (lang.id !== 'any') {
     const byLang = candidates.filter(s => lang.genre.test(s.genre ?? ''));
-    if (byLang.length >= TOTAL_ROUNDS) {
+    if (byLang.length >= rounds) {
       candidates = byLang;
-    } else if (a) {
-      note = `Couldn't confirm ${lang.label} for every song, so all of ${a}'s songs are included.`;
+    } else if (artists.length) {
+      note = `Couldn't confirm ${lang.label} for every song, so all songs by the chosen artists are included.`;
     } else {
-      throw new Error(`Not enough ${lang.label} songs found. Try an artist instead.`);
+      throw new Error(`Not enough ${lang.label} songs found. Try adding an artist.`);
     }
   }
 
@@ -171,7 +216,9 @@ export async function buildAutoPlaylist(artist: string, languageId: string): Pro
     seen.add(k);
     return true;
   });
-  if (pool.length < TOTAL_ROUNDS) throw new Error('Not enough different songs found. Try another search.');
+  if (pool.length < rounds) {
+    throw new Error(`Only ${pool.length} playable songs found, but the game needs ${rounds}. Add another artist or lower the rounds in Settings.`);
+  }
 
-  return { playlist: pool.slice(0, TOTAL_ROUNDS), pool, note };
+  return { playlist: pool.slice(0, rounds), pool, note };
 }

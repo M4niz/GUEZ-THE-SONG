@@ -36,6 +36,11 @@ class RealtimeAdapter {
         this.triggerLocal(payload.event, payload.payload);
       });
 
+      // Presence reports tabs that vanish without saying goodbye (closed, crashed, offline)
+      this.sbChannel.on('presence', { event: 'leave' }, ({ leftPresences }) => {
+        (leftPresences as any[]).forEach(p => this.triggerLocal('presence_leave', p));
+      });
+
       this.sbChannel.subscribe((status) => {
         console.log(`[Realtime] Supabase status: ${status}`);
         if (status === 'SUBSCRIBED') {
@@ -95,14 +100,20 @@ class RealtimeAdapter {
     // it's strictly client -> host.
   }
 
+  /** Announce this client on the channel's presence list (Supabase only) */
+  public track(meta: Record<string, unknown>) {
+    this.sbChannel?.track(meta).catch(e => console.warn('[Realtime] track failed', e));
+  }
+
   public cleanup() {
-    if (this.sbChannel) {
-      supabase?.removeChannel(this.sbChannel);
-    }
-    if (this.bcChannel) {
-      this.bcChannel.close();
-    }
     this.handlers.clear();
+    // Give a final 'leave'/'host_left' broadcast a moment to flush before the channel closes
+    const sb = this.sbChannel;
+    const bc = this.bcChannel;
+    window.setTimeout(() => {
+      if (sb) supabase?.removeChannel(sb);
+      if (bc) bc.close();
+    }, 400);
   }
 }
 
